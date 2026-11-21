@@ -43,3 +43,35 @@ content preserves the existing file and reports a conflict. If AMC storage
 is unavailable, the TCC worker keeps the record available for retry. The
 worker can replay current and pending records after restart.
 [TCC acceptance and handoff behavior](../bullseye-tcc/README.md#archive-handoff)
+
+## Capacity monitoring
+
+With AMC and capacity monitoring enabled, UOG starts the first scan at
+service startup and repeats it at the configured interval. Monitoring is
+read-only and reports its results in the UOG logs.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `bullseye.uog.amc.capacity.enabled` | `true` | Enable periodic capacity scans when AMC is enabled. |
+| `bullseye.uog.amc.capacity.interval-seconds` | `60` | Time between scans, in seconds. |
+| `bullseye.uog.amc.capacity.min-free-bytes` | `1073741824` | Minimum usable bytes per distinct filesystem volume. Set to `0` to disable low-space warnings. |
+
+Each `[UOG] Archive storage usage.` entry reports `.records` and `.bytes`
+for these locations.
+
+| Location | Counted data |
+| --- | --- |
+| `cccArchive` | Committed regular `.json` files directly under the CCC audit archive directory. |
+| `tccArchive` | Committed regular `.json` files at the node/run depth in the TCC telemetry archive. |
+| `cccSource` | The original CCC audit JSONL file. `.records` is `0` or `1` and `.bytes` covers the whole file. |
+| `tccPending` | Regular `.json` files in `.amc-pending` under the TCC latest-record directory. |
+
+Counts and logical bytes report zero until a location exists. A failed
+measurement is reported as unavailable. Logical bytes measure file content
+size. Each distinct filesystem volume also reports its usable bytes. UOG
+logs one warning per volume per low-space episode and a recovery when its
+usable space reaches the configured minimum again.
+
+The monitor consumes storage usage probes. The current probes scan files,
+and a database-backed archive can provide the same measurements through
+that probe contract.
