@@ -22,7 +22,7 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.function.BooleanSupplier;
 
-public final class TccReceiver {
+public final class TccReceiver implements AutoCloseable {
     public static final String CAPABILITY = "tcc.snapshot.v1";
 
     private static final ObjectMapper JSON = new ObjectMapper()
@@ -31,11 +31,30 @@ public final class TccReceiver {
 
     private final Path latestDirectory;
     private final Object storeLock = new Object();
+    private final TccTelemetryHandoff handoff;
 
     public TccReceiver(Path latestDirectory) throws IOException {
+        this(latestDirectory, null);
+    }
+
+    public TccReceiver(Path latestDirectory, TccTelemetryHandoff.Sink archive) throws IOException {
         this.latestDirectory = Files.createDirectories(
                 Objects.requireNonNull(latestDirectory, "latestDirectory")
                         .toAbsolutePath().normalize());
+        this.handoff = archive == null ? null : new TccTelemetryHandoff(this.latestDirectory, archive);
+    }
+
+    public void startHandoff() {
+        if (handoff != null) {
+            handoff.start();
+        }
+    }
+
+    @Override
+    public void close() {
+        if (handoff != null) {
+            handoff.close();
+        }
     }
 
     /**
@@ -68,7 +87,8 @@ public final class TccReceiver {
                 return acknowledgement(sequence, "REJECTED", "SESSION_INACTIVE");
             }
             try {
-                ObjectNode latest = readLatest(latestFile, nodeId);
+                StoredTelemetry previous = readLatest(latestFile, nodeId);
+                ObjectNode latest = previous == null ? null : previous.telemetry();
                 if (latest != null && expectedRunId.equals(latest.path("runId").textValue())) {
                     long latestSequence = TccSnapshotV1.sequence(latest);
                     if (sequence < latestSequence) {
@@ -83,7 +103,7 @@ public final class TccReceiver {
                         return acknowledgement(sequence, "REJECTED", "TIMELINE_REGRESSION");
                     }
                 }
-                return replaceLatest(latestFile, telemetry, sessionActive)
+                return replaceLatest(latestFile, telemetry, previous, sessionActive)
                         ? acknowledgement(sequence, "ACCEPTED", null)
                         : acknowledgement(sequence, "REJECTED", "SESSION_INACTIVE");
             } catch (IOException failure) {
@@ -107,14 +127,15 @@ public final class TccReceiver {
                 || submitted.path("version").longValue() < latest.path("version").longValue();
     }
 
-    private static ObjectNode readLatest(Path file, String nodeId) throws IOException {
-        try (var input = Files.newInputStream(file)) {
-            JsonNode previous = JSON.readTree(input);
+    private static StoredTelemetry readLatest(Path file, String nodeId) throws IOException {
+        try {
+            byte[] contents = Files.readAllBytes(file);
+            JsonNode previous = JSON.readTree(contents);
             if (previous instanceof ObjectNode telemetry
                     && TccSnapshotV1.sequence(telemetry) > 0) {
                 String runId = telemetry.path("runId").textValue();
                 if (canonicalUuid(runId) && TccSnapshotV1.valid(telemetry, nodeId, runId)) {
-                    return telemetry;
+                    return new StoredTelemetry(telemetry, contents);
                 }
             }
             throw new IOException("Invalid persisted telemetry");
@@ -124,26 +145,45 @@ public final class TccReceiver {
     }
 
     private boolean replaceLatest(
-            Path latestFile, ObjectNode telemetry, BooleanSupplier sessionActive) throws IOException {
-        Path temporary = Files.createTempFile(latestDirectory, "tcc-", ".tmp");
+            Path latestFile, ObjectNode telemetry, StoredTelemetry previous,
+            BooleanSupplier sessionActive) throws IOException {
+        Path temporary = Files.createTempFile(latestDirectory, ".tcc-", ".tmp");
         try {
-            ByteBuffer content = ByteBuffer.wrap(JSON.writeValueAsBytes(telemetry));
-            try (FileChannel channel = FileChannel.open(temporary, StandardOpenOption.WRITE)) {
-                while (content.hasRemaining()) {
-                    channel.write(content);
-                }
-                channel.force(true);
+            writeAndForce(temporary, JSON.writeValueAsBytes(telemetry));
+            if (handoff != null && previous != null) {
+                handoff.preserve(latestFile, previous.contents());
             }
             if (!sessionActive.getAsBoolean()) {
                 return false;
             }
             Files.move(temporary, latestFile,
                     StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            forceDirectoryBestEffort(latestDirectory);
             return true;
         } finally {
             Files.deleteIfExists(temporary);
         }
     }
+
+    static void writeAndForce(Path file, byte[] contents) throws IOException {
+        ByteBuffer content = ByteBuffer.wrap(contents);
+        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.WRITE)) {
+            while (content.hasRemaining()) {
+                channel.write(content);
+            }
+            channel.force(true);
+        }
+    }
+
+    static void forceDirectoryBestEffort(Path directory) {
+        try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
+            channel.force(true);
+        } catch (IOException | UnsupportedOperationException unsupported) {
+            // Forcing directory entries is not supported by every filesystem.
+        }
+    }
+
+    private record StoredTelemetry(ObjectNode telemetry, byte[] contents) {}
 
     private static boolean canonicalUuid(String value) {
         try {
@@ -154,10 +194,13 @@ public final class TccReceiver {
     }
 
     private static String fileName(String nodeId) {
+        return sha256(nodeId.getBytes(StandardCharsets.UTF_8)) + ".json";
+    }
+
+    static String sha256(byte[] contents) {
         try {
-            byte[] digest = MessageDigest.getInstance("SHA-256")
-                    .digest(nodeId.getBytes(StandardCharsets.UTF_8));
-            return HexFormat.of().formatHex(digest) + ".json";
+            byte[] digest = MessageDigest.getInstance("SHA-256").digest(contents);
+            return HexFormat.of().formatHex(digest);
         } catch (NoSuchAlgorithmException unavailable) {
             throw new IllegalStateException("SHA-256 is required by the Java runtime", unavailable);
         }
