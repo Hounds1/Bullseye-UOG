@@ -1,6 +1,7 @@
 package io.bullseye.uog;
 
 import io.bullseye.uog.ccc.CccServer;
+import io.bullseye.uog.tcc.TccReceiver;
 
 import javax.net.ssl.SSLContext;
 import java.io.IOException;
@@ -12,8 +13,10 @@ import java.util.HashMap;
 import java.util.Properties;
 
 public final class UogApplication {
-    private static final String PREFIX = "bullseye.uog.ccc.";
-    private static final String ALLOW_PREFIX = PREFIX + "allow.";
+    private static final String CCC_PREFIX = "bullseye.uog.ccc.";
+    private static final String ALLOW_PREFIX = CCC_PREFIX + "allow.";
+    private static final String TCC_ENABLED = "bullseye.uog.tcc.enabled";
+    private static final String TCC_DIRECTORY = "bullseye.uog.tcc.latest-directory";
 
     private UogApplication() {}
 
@@ -22,10 +25,13 @@ public final class UogApplication {
             throw new IllegalArgumentException("Expected a single UOG properties file");
         }
         Path config = args.length == 0 ? Path.of("config", "bullseye-uog.properties") : Path.of(args[0]);
-        var settings = loadSettings(config);
+        var properties = new Properties();
+        try (var reader = Files.newBufferedReader(config, StandardCharsets.UTF_8)) {
+            properties.load(reader);
+        }
         requireTlsStore("javax.net.ssl.keyStore");
         requireTlsStore("javax.net.ssl.trustStore");
-        try (var server = new CccServer(SSLContext.getDefault(), settings)) {
+        try (var server = createServer(SSLContext.getDefault(), properties)) {
             Runtime.getRuntime().addShutdownHook(
                     new Thread(() -> shutdown(server), "bullseye-uog-shutdown"));
             server.start();
@@ -34,11 +40,20 @@ public final class UogApplication {
         }
     }
 
-    static CccServer.Settings loadSettings(Path path) throws IOException {
-        var properties = new Properties();
-        try (var reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
-            properties.load(reader);
+    private static CccServer createServer(SSLContext tls, Properties properties) throws IOException {
+        CccServer.Settings settings = loadCccSettings(properties);
+        String enabled = text(properties, TCC_ENABLED, "true");
+        if ("false".equalsIgnoreCase(enabled)) {
+            return new CccServer(tls, settings);
         }
+        if (!"true".equalsIgnoreCase(enabled)) {
+            throw new IllegalArgumentException(TCC_ENABLED + " must be true or false");
+        }
+        var tcc = new TccReceiver(Path.of(text(properties, TCC_DIRECTORY, "var/tcc/latest")));
+        return new CccServer(tls, settings, TccReceiver.CAPABILITY, tcc::receive);
+    }
+
+    private static CccServer.Settings loadCccSettings(Properties properties) {
         var allowedNodes = new HashMap<String, String>();
         for (String key : properties.stringPropertyNames()) {
             if (key.startsWith(ALLOW_PREFIX)) {
@@ -49,29 +64,29 @@ public final class UogApplication {
         if (allowedNodes.isEmpty()) {
             throw new IllegalArgumentException("Configure at least one " + ALLOW_PREFIX + "<nodeId>");
         }
-        String host = text(properties, "bind-host", "127.0.0.1");
+        String host = text(properties, CCC_PREFIX + "bind-host", "127.0.0.1");
         return new CccServer.Settings(
                 new InetSocketAddress(host, integer(properties, "port", 7443)),
                 allowedNodes,
-                Path.of(text(properties, "audit-file", "var/ccc-audit.jsonl")),
+                Path.of(text(properties, CCC_PREFIX + "audit-file", "var/ccc-audit.jsonl")),
                 integer(properties, "heartbeat-ms", 5_000),
                 integer(properties, "admission-timeout-ms", 5_000),
                 integer(properties, "max-connections", 128));
     }
 
     private static String text(Properties properties, String key, String defaultValue) {
-        String value = properties.getProperty(PREFIX + key, defaultValue).strip();
+        String value = properties.getProperty(key, defaultValue).strip();
         if (value.isEmpty()) {
-            throw new IllegalArgumentException(PREFIX + key + " must not be blank");
+            throw new IllegalArgumentException(key + " must not be blank");
         }
         return value;
     }
 
     private static int integer(Properties properties, String key, int defaultValue) {
         try {
-            return Integer.parseInt(text(properties, key, Integer.toString(defaultValue)));
+            return Integer.parseInt(text(properties, CCC_PREFIX + key, Integer.toString(defaultValue)));
         } catch (NumberFormatException failure) {
-            throw new IllegalArgumentException(PREFIX + key + " must be an integer", failure);
+            throw new IllegalArgumentException(CCC_PREFIX + key + " must be an integer", failure);
         }
     }
 

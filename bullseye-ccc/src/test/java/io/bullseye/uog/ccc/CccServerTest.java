@@ -27,7 +27,10 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.KeyManagerFactory;
@@ -46,6 +49,7 @@ class CccServerTest {
     private static final String NODE_ID = "registered-core";
     private static final String TEST_PASSWORD = "fixture-only";
     private static final int HEARTBEAT_MILLIS = 250;
+    private static final int APPLICATION_HEARTBEAT_MILLIS = 500;
     private static final int SOCKET_TIMEOUT_MILLIS = 5_000;
 
     @TempDir
@@ -87,6 +91,7 @@ class CccServerTest {
             assertEquals(request.path("requestId"), accepted.path("requestId"));
             assertFalse(accepted.path("sessionId").asText().isBlank());
             assertEquals(HEARTBEAT_MILLIS, accepted.path("heartbeatIntervalMs").asInt());
+            assertFalse(accepted.has("capabilities"));
 
             long first = receivePing(connection);
             send(connection, message("PONG").put("sequence", first));
@@ -100,6 +105,94 @@ class CccServerTest {
             assertEquals(registeredFingerprint, audit.getFirst().path("certificateSha256").asText());
             assertEquals(registeredFingerprint, audit.getLast().path("certificateSha256").asText());
             assertEquals(accepted.path("sessionId"), audit.getLast().path("sessionId"));
+        }
+    }
+
+    @Test
+    void keepsHeartbeatLiveWhileAnApplicationHandlerWaits() throws Exception {
+        var entered = new CountDownLatch(1);
+        var finish = new CountDownLatch(1);
+        var admittedNode = new AtomicReference<String>();
+        var admittedRun = new AtomicReference<UUID>();
+        var sessionActive = new AtomicReference<BooleanSupplier>();
+        CccServer.SessionHandler handler = (nodeId, runId, frame, active) -> {
+            admittedNode.set(nodeId);
+            admittedRun.set(runId);
+            sessionActive.set(active);
+            entered.countDown();
+            await(finish);
+            return message("APP_ACK").put("sequence", frame.path("sequence").longValue());
+        };
+
+        try (CccServer server = server(handler);
+                SSLSocket connection = connect(server, registeredClient)) {
+            ObjectNode request = join(NODE_ID);
+            send(connection, request);
+            JsonNode accepted = read(connection);
+            assertEquals("JOIN_ACCEPTED", accepted.path("type").asText());
+            assertEquals("app.v1", accepted.path("capabilities").get(0).asText());
+            replyToPing(connection);
+
+            send(connection, message("APP_FRAME").put("sequence", 12));
+            assertTrue(entered.await(3, TimeUnit.SECONDS));
+            assertEquals(NODE_ID, admittedNode.get());
+            assertEquals(UUID.fromString(request.path("runId").asText()), admittedRun.get());
+            assertTrue(sessionActive.get().getAsBoolean());
+            replyToPing(connection);
+            replyToPing(connection);
+            finish.countDown();
+
+            JsonNode reply = read(connection);
+            if ("PING".equals(reply.path("type").asText())) {
+                send(connection, message("PONG").put("sequence", reply.path("sequence").longValue()));
+                reply = read(connection);
+            }
+            assertEquals("APP_ACK", reply.path("type").asText());
+            assertEquals(12, reply.path("sequence").longValue());
+        } finally {
+            finish.countDown();
+        }
+        assertFalse(sessionActive.get().getAsBoolean());
+    }
+
+    @Test
+    void closesWhenAnotherApplicationFrameArrivesBeforeTheHandlerFinishes() throws Exception {
+        var entered = new CountDownLatch(1);
+        var finish = new CountDownLatch(1);
+        CccServer.SessionHandler handler = (nodeId, runId, frame, active) -> {
+            entered.countDown();
+            await(finish);
+            return message("APP_ACK");
+        };
+
+        try (CccServer server = server(handler);
+                SSLSocket connection = connect(server, registeredClient)) {
+            send(connection, join(NODE_ID));
+            assertEquals("JOIN_ACCEPTED", read(connection).path("type").asText());
+            replyToPing(connection);
+            send(connection, message("APP_FRAME").put("sequence", 1));
+            assertTrue(entered.await(3, TimeUnit.SECONDS));
+            send(connection, message("APP_FRAME").put("sequence", 2));
+            var closed = awaitAudit(3).getLast();
+            assertEquals("SESSION_CLOSED", closed.path("event").asText());
+            assertEquals("CONNECTION_CLOSED", closed.path("reasonCode").asText());
+        } finally {
+            finish.countDown();
+        }
+    }
+
+    private static void replyToPing(SSLSocket connection) throws IOException {
+        send(connection, message("PONG").put("sequence", receivePing(connection)));
+    }
+
+    private static void await(CountDownLatch finish) throws IOException {
+        try {
+            if (!finish.await(5, TimeUnit.SECONDS)) {
+                throw new IOException("Application handler was not released");
+            }
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Application handler interrupted", failure);
         }
     }
 
@@ -168,13 +261,20 @@ class CccServerTest {
     }
 
     private CccServer server() throws IOException {
-        CccServer server = new CccServer(serverContext, new CccServer.Settings(
+        return server(null);
+    }
+
+    private CccServer server(CccServer.SessionHandler handler) throws IOException {
+        CccServer.Settings settings = new CccServer.Settings(
                 new InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
                 Map.of(NODE_ID, registeredFingerprint),
                 auditPath(),
-                HEARTBEAT_MILLIS,
+                handler == null ? HEARTBEAT_MILLIS : APPLICATION_HEARTBEAT_MILLIS,
                 3_000,
-                8));
+                8);
+        CccServer server = handler == null
+                ? new CccServer(serverContext, settings)
+                : new CccServer(serverContext, settings, "app.v1", handler);
         server.start();
         return server;
     }
