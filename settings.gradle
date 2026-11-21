@@ -1,0 +1,3 @@
+rootProject.name = 'bullseye-uog'
+
+include('bullseye-uog-app', 'bullseye-ccc')

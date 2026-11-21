@@ -1,0 +1,23 @@
+plugins {
+    id 'application'
+}
+
+dependencies {
+    implementation project(':bullseye-ccc')
+}
+
+application {
+    mainClass = 'io.bullseye.uog.UogApplication'
+    applicationName = 'bullseye-uog'
+}
+
+distributions {
+    main {
+        distributionBaseName = 'bullseye-uog'
+        contents {
+            from(rootProject.file('config/bullseye-uog.properties')) {
+                into 'config'
+            }
+        }
+    }
+}

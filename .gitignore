@@ -1,0 +1,12 @@
+.gradle/
+build/
+.idea/
+*.iml
+.vscode/
+out/
+.DS_Store
+/var/
+*.p12
+*.pfx
+*.jks
+*.key
