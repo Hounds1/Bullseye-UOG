@@ -1,10 +1,13 @@
 package io.bullseye.uog;
 
 import io.bullseye.uog.amc.AmcAuditArchive;
+import io.bullseye.uog.amc.AmcCapacityMonitor;
+import io.bullseye.uog.amc.AmcFileCapacity;
 import io.bullseye.uog.amc.AmcTelemetryArchive;
 import io.bullseye.uog.ccc.CccAuditHandoff;
 import io.bullseye.uog.ccc.CccServer;
 import io.bullseye.uog.tcc.TccReceiver;
+import io.bullseye.uog.tcc.TccTelemetryHandoff;
 
 import javax.net.ssl.SSLContext;
 import java.io.IOException;
@@ -13,6 +16,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.Map;
 import java.util.Properties;
 
 public final class UogApplication {
@@ -23,6 +27,7 @@ public final class UogApplication {
     private static final String AMC_ENABLED = "bullseye.uog.amc.enabled";
     private static final String AMC_AUDIT_DIRECTORY = "bullseye.uog.amc.ccc-audit-directory";
     private static final String AMC_TELEMETRY_DIRECTORY = "bullseye.uog.amc.tcc-telemetry-directory";
+    private static final String CAPACITY_PREFIX = "bullseye.uog.amc.capacity.";
     private static final String AUDIT_CHECKPOINT = CCC_PREFIX + "audit-checkpoint";
 
     private UogApplication() {}
@@ -42,9 +47,10 @@ public final class UogApplication {
         boolean archiveEnabled = enabled(properties, AMC_ENABLED);
         try (var tcc = createTcc(properties, archiveEnabled);
                 var server = createServer(SSLContext.getDefault(), settings, tcc);
-                var handoff = createAuditHandoff(server, settings, properties, archiveEnabled)) {
+                var handoff = createAuditHandoff(server, settings, properties, archiveEnabled);
+                var capacity = createCapacityMonitor(settings, properties, archiveEnabled)) {
             Runtime.getRuntime().addShutdownHook(
-                    new Thread(() -> shutdown(server, handoff, tcc), "bullseye-uog-shutdown"));
+                    new Thread(() -> shutdown(server, handoff, tcc, capacity), "bullseye-uog-shutdown"));
             if (handoff != null) {
                 handoff.start();
             }
@@ -53,6 +59,9 @@ public final class UogApplication {
             }
             server.start();
             System.out.println("[UOG] Cluster control online. address=" + server.localAddress());
+            if (capacity != null) {
+                capacity.start();
+            }
             server.awaitTermination();
         }
     }
@@ -61,12 +70,11 @@ public final class UogApplication {
         if (!enabled(properties, TCC_ENABLED)) {
             return null;
         }
-        Path latest = Path.of(text(properties, TCC_DIRECTORY, "var/tcc/latest"));
+        Path latest = tccDirectory(properties);
         if (!archiveEnabled) {
             return new TccReceiver(latest);
         }
-        var archive = new AmcTelemetryArchive(
-                Path.of(text(properties, AMC_TELEMETRY_DIRECTORY, "var/amc/tcc-telemetry")));
+        var archive = new AmcTelemetryArchive(telemetryArchiveDirectory(properties));
         return new TccReceiver(latest, archive::store);
     }
 
@@ -83,11 +91,62 @@ public final class UogApplication {
         if (!archiveEnabled) {
             return null;
         }
-        var archive = new AmcAuditArchive(
-                Path.of(text(properties, AMC_AUDIT_DIRECTORY, "var/amc/ccc-audit")));
+        var archive = new AmcAuditArchive(auditArchiveDirectory(properties));
         Path checkpoint = Path.of(text(properties, AUDIT_CHECKPOINT,
                 settings.auditFile() + ".amc-offset"));
         return server.auditHandoff(checkpoint, archive::store);
+    }
+
+    private static AmcCapacityMonitor createCapacityMonitor(
+            CccServer.Settings settings, Properties properties, boolean archiveEnabled) {
+        if (!archiveEnabled || !enabled(properties, CAPACITY_PREFIX + "enabled")) {
+            return null;
+        }
+
+        long interval = capacityNumber(properties, "interval-seconds", 60, 1);
+        long minimumBytes = capacityNumber(properties, "min-free-bytes", 1_073_741_824L, 0);
+        Path cccArchive = auditArchiveDirectory(properties);
+        Path tccArchive = telemetryArchiveDirectory(properties);
+        Path cccSource = settings.auditFile();
+        Path tccPending = TccTelemetryHandoff.pendingDirectory(tccDirectory(properties));
+
+        Map<String, AmcCapacityMonitor.UsageProbe> sources = Map.of(
+                "cccArchive", () -> AmcFileCapacity.records(cccArchive, 1),
+                "tccArchive", () -> AmcFileCapacity.records(tccArchive, 3),
+                "cccSource", () -> AmcFileCapacity.sourceFile(cccSource),
+                "tccPending", () -> AmcFileCapacity.records(tccPending, 1));
+        Map<String, Path> volumes = Map.of(
+                "cccArchive", cccArchive,
+                "tccArchive", tccArchive,
+                "cccSource", cccSource,
+                "tccPending", tccPending);
+        return new AmcCapacityMonitor(sources, volumes, interval, minimumBytes);
+    }
+
+    private static Path auditArchiveDirectory(Properties properties) {
+        return Path.of(text(properties, AMC_AUDIT_DIRECTORY, "var/amc/ccc-audit"));
+    }
+
+    private static Path telemetryArchiveDirectory(Properties properties) {
+        return Path.of(text(properties, AMC_TELEMETRY_DIRECTORY, "var/amc/tcc-telemetry"));
+    }
+
+    private static Path tccDirectory(Properties properties) {
+        return Path.of(text(properties, TCC_DIRECTORY, "var/tcc/latest"));
+    }
+
+    private static long capacityNumber(Properties properties, String name, long fallback, long minimum) {
+        String key = CAPACITY_PREFIX + name;
+        String error = key + " must be an integer of at least " + minimum;
+        try {
+            long value = Long.parseLong(text(properties, key, Long.toString(fallback)));
+            if (value < minimum) {
+                throw new IllegalArgumentException(error);
+            }
+            return value;
+        } catch (NumberFormatException failure) {
+            throw new IllegalArgumentException(error, failure);
+        }
     }
 
     private static boolean enabled(Properties properties, String key) {
@@ -145,7 +204,11 @@ public final class UogApplication {
         }
     }
 
-    private static void shutdown(CccServer server, CccAuditHandoff handoff, TccReceiver tcc) {
+    private static void shutdown(CccServer server, CccAuditHandoff handoff, TccReceiver tcc,
+            AmcCapacityMonitor capacity) {
+        if (capacity != null) {
+            capacity.close();
+        }
         server.close();
         try {
             server.awaitTermination();

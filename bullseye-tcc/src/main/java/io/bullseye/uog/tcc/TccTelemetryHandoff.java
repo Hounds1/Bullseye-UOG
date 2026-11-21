@@ -30,8 +30,12 @@ public final class TccTelemetryHandoff implements AutoCloseable {
 
     TccTelemetryHandoff(Path latestDirectory, Sink sink) {
         this.latestDirectory = latestDirectory;
-        this.pendingDirectory = latestDirectory.resolve(".amc-pending");
+        this.pendingDirectory = pendingDirectory(latestDirectory);
         this.sink = sink;
+    }
+
+    public static Path pendingDirectory(Path latestDirectory) {
+        return latestDirectory.resolve(".amc-pending");
     }
 
     /**
