@@ -1,5 +1,7 @@
 package io.bullseye.uog;
 
+import io.bullseye.uog.amc.AmcAuditArchive;
+import io.bullseye.uog.ccc.CccAuditHandoff;
 import io.bullseye.uog.ccc.CccServer;
 import io.bullseye.uog.tcc.TccReceiver;
 
@@ -17,6 +19,9 @@ public final class UogApplication {
     private static final String ALLOW_PREFIX = CCC_PREFIX + "allow.";
     private static final String TCC_ENABLED = "bullseye.uog.tcc.enabled";
     private static final String TCC_DIRECTORY = "bullseye.uog.tcc.latest-directory";
+    private static final String AMC_ENABLED = "bullseye.uog.amc.enabled";
+    private static final String AMC_DIRECTORY = "bullseye.uog.amc.ccc-audit-directory";
+    private static final String AUDIT_CHECKPOINT = CCC_PREFIX + "audit-checkpoint";
 
     private UogApplication() {}
 
@@ -29,28 +34,52 @@ public final class UogApplication {
         try (var reader = Files.newBufferedReader(config, StandardCharsets.UTF_8)) {
             properties.load(reader);
         }
+        var settings = loadCccSettings(properties);
         requireTlsStore("javax.net.ssl.keyStore");
         requireTlsStore("javax.net.ssl.trustStore");
-        try (var server = createServer(SSLContext.getDefault(), properties)) {
+        try (var server = createServer(SSLContext.getDefault(), settings, properties);
+                var handoff = createAuditHandoff(server, settings, properties)) {
             Runtime.getRuntime().addShutdownHook(
-                    new Thread(() -> shutdown(server), "bullseye-uog-shutdown"));
+                    new Thread(() -> shutdown(server, handoff), "bullseye-uog-shutdown"));
+            if (handoff != null) {
+                handoff.start();
+            }
             server.start();
             System.out.println("[UOG] Cluster control online. address=" + server.localAddress());
             server.awaitTermination();
         }
     }
 
-    private static CccServer createServer(SSLContext tls, Properties properties) throws IOException {
-        CccServer.Settings settings = loadCccSettings(properties);
-        String enabled = text(properties, TCC_ENABLED, "true");
-        if ("false".equalsIgnoreCase(enabled)) {
+    private static CccServer createServer(
+            SSLContext tls, CccServer.Settings settings, Properties properties) throws IOException {
+        if (!enabled(properties, TCC_ENABLED)) {
             return new CccServer(tls, settings);
-        }
-        if (!"true".equalsIgnoreCase(enabled)) {
-            throw new IllegalArgumentException(TCC_ENABLED + " must be true or false");
         }
         var tcc = new TccReceiver(Path.of(text(properties, TCC_DIRECTORY, "var/tcc/latest")));
         return new CccServer(tls, settings, TccReceiver.CAPABILITY, tcc::receive);
+    }
+
+    private static CccAuditHandoff createAuditHandoff(
+            CccServer server, CccServer.Settings settings, Properties properties) {
+        if (!enabled(properties, AMC_ENABLED)) {
+            return null;
+        }
+        var archive = new AmcAuditArchive(
+                Path.of(text(properties, AMC_DIRECTORY, "var/amc/ccc-audit")));
+        Path checkpoint = Path.of(text(properties, AUDIT_CHECKPOINT,
+                settings.auditFile() + ".amc-offset"));
+        return server.auditHandoff(checkpoint, archive::store);
+    }
+
+    private static boolean enabled(Properties properties, String key) {
+        String value = text(properties, key, "true");
+        if ("true".equalsIgnoreCase(value)) {
+            return true;
+        }
+        if ("false".equalsIgnoreCase(value)) {
+            return false;
+        }
+        throw new IllegalArgumentException(key + " must be true or false");
     }
 
     private static CccServer.Settings loadCccSettings(Properties properties) {
@@ -97,12 +126,16 @@ public final class UogApplication {
         }
     }
 
-    private static void shutdown(CccServer server) {
+    private static void shutdown(CccServer server, CccAuditHandoff handoff) {
         server.close();
         try {
             server.awaitTermination();
         } catch (InterruptedException stopping) {
             Thread.currentThread().interrupt();
+        } finally {
+            if (handoff != null) {
+                handoff.close();
+            }
         }
     }
 }

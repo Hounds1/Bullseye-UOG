@@ -125,6 +125,10 @@ public final class CccServer implements AutoCloseable {
         return (InetSocketAddress) listener.getLocalSocketAddress();
     }
 
+    public CccAuditHandoff auditHandoff(Path checkpoint, CccAuditHandoff.Sink sink) {
+        return new CccAuditHandoff(audit, checkpoint, sink);
+    }
+
     public void awaitTermination() throws InterruptedException {
         synchronized (lock) {
             while (!shutdownCompleted || accepting || !connections.isEmpty()) {

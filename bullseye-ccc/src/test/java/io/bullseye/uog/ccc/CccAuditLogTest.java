@@ -1,7 +1,9 @@
 package io.bullseye.uog.ccc;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -12,6 +14,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -65,6 +68,32 @@ class CccAuditLogTest {
         assertNotEquals(
                 UUID.fromString(first.get("eventId").textValue()),
                 UUID.fromString(second.get("eventId").textValue()));
+    }
+
+    @Test
+    void readsCommittedByteOffsetsAndRepairsAnInterruptedAppend() throws Exception {
+        Path file = temporaryDirectory.resolve("events.jsonl");
+        CccAuditLog log = new CccAuditLog(file);
+        log.append("JOIN_REQUESTED", "서울-노드", null, null, null, null, null);
+        var first = log.readCommitted(0);
+        long firstOffset = Files.size(file);
+        assertEquals(firstOffset, first.nextOffset());
+        assertTrue(firstOffset > first.json().length() + 1L);
+        assertEquals("서울-노드", JSON.readTree(first.json()).path("nodeId").textValue());
+
+        Files.writeString(file, "{\"incomplete\":\"" + "x".repeat(8_000), StandardOpenOption.APPEND);
+        Files.write(file, new byte[] {(byte) 0xED}, StandardOpenOption.APPEND);
+        assertTrue(log.isCommittedOffset(firstOffset));
+        assertFalse(log.isCommittedOffset(Files.size(file)));
+        assertNull(log.readCommitted(firstOffset));
+
+        CccAuditLog reopened = new CccAuditLog(file);
+        reopened.append("JOIN_ACCEPTED", "서울-노드", null, null, null, null, null);
+        assertEquals(first, reopened.readCommitted(0));
+        var second = reopened.readCommitted(firstOffset);
+        assertEquals("JOIN_ACCEPTED", JSON.readTree(second.json()).path("event").textValue());
+        assertEquals(Files.size(file), second.nextOffset());
+        assertNull(reopened.readCommitted(second.nextOffset()));
     }
 
     @Test
