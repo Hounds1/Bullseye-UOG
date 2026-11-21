@@ -72,6 +72,21 @@ size. Each distinct filesystem volume also reports its usable bytes. UOG
 logs one warning per volume per low-space episode and a recovery when its
 usable space reaches the configured minimum again.
 
+Each scan also reports archive handoff progress.
+
+| Field | Meaning |
+| --- | --- |
+| `cccHandoff.pendingBytes` | Committed audit bytes after the CCC handoff checkpoint. The original JSONL file still contains all recorded events. |
+| `tccHandoff.pendingLatest` | Current TCC latest files whose exact contents have yet to be confirmed by the archive. The `tccPending` counters track superseded files still in the handoff directory. |
+| `cccHandoff.lastSuccessAt` | UTC time of the most recent archive confirmation with a saved CCC checkpoint in this UOG process. |
+| `tccHandoff.lastSuccessAt` | UTC time of the most recent confirmed latest or superseded TCC delivery in this UOG process. |
+
+The last-success fields show `UNKNOWN` until the worker confirms its first
+delivery. A probe failure or a CCC checkpoint still loading is reported as
+`<handoff>.status=UNAVAILABLE`. TCC progress is included when TCC is enabled.
+The TCC worker checks existing latest records again after a restart so it
+can confirm their presence in AMC using idempotent delivery.
+
 The monitor consumes storage usage probes. The current probes scan files,
 and a database-backed archive can provide the same measurements through
 that probe contract.

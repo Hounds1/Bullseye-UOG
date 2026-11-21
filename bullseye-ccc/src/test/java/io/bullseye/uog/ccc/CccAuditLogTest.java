@@ -11,6 +11,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -22,6 +23,9 @@ import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 class CccAuditLogTest {
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -94,6 +98,63 @@ class CccAuditLogTest {
         assertEquals("JOIN_ACCEPTED", JSON.readTree(second.json()).path("event").textValue());
         assertEquals(Files.size(file), second.nextOffset());
         assertNull(reopened.readCommitted(second.nextOffset()));
+    }
+
+    @Test
+    void reconcilesUnclosedAdmissionsOnceAfterRestartAndRepairsATornTail() throws Exception {
+        Path file = temporaryDirectory.resolve("events.jsonl");
+        var audit = new CccAuditLog(file);
+        UUID request = UUID.randomUUID();
+        UUID run = UUID.randomUUID();
+        UUID ended = UUID.randomUUID();
+        UUID unclosed = UUID.randomUUID();
+        audit.append("JOIN_ACCEPTED", "ended", request, run, ended, "a", null);
+        audit.append("SESSION_CLOSED", "ended", request, run, ended, "a", "CONNECTION_CLOSED");
+        audit.append("JOIN_ACCEPTED", "open", request, run, unclosed, "b", null);
+        long committed = Files.size(file);
+        Files.writeString(file, "{\"torn\":", StandardOpenOption.APPEND);
+        assertEquals(committed, audit.committedSize());
+        assertTrue(Files.size(file) > committed);
+
+        Instant recoveryStartedAt = Instant.now();
+        var restarted = new CccAuditLog(file);
+        restarted.reconcileSessions();
+        var recovered = JSON.readTree(restarted.readCommitted(committed).json());
+        assertEquals("SESSION_CLOSED", recovered.path("event").textValue());
+        assertEquals("RECOVERED_AFTER_RESTART", recovered.path("reasonCode").textValue());
+        assertEquals(unclosed.toString(), recovered.path("sessionId").textValue());
+        assertEquals(request.toString(), recovered.path("requestId").textValue());
+        assertEquals(run.toString(), recovered.path("runId").textValue());
+        assertEquals("open", recovered.path("nodeId").textValue());
+        assertEquals("b", recovered.path("certificateSha256").textValue());
+        assertFalse(Instant.parse(recovered.path("occurredAt").textValue()).isBefore(recoveryStartedAt));
+
+        String ledger = Files.readString(file);
+        restarted.reconcileSessions();
+        assertEquals(ledger, Files.readString(file));
+    }
+
+    @Test
+    void retriesCloseWithTheSameEventIdTimeAndBodyAfterAnAmbiguousFailure() throws Exception {
+        var attempts = new LinkedBlockingQueue<String>();
+        var count = new AtomicInteger();
+        var writer = new CccCloseAudit(line -> {
+            attempts.add(line);
+            if (count.getAndIncrement() == 0) {
+                throw new IOException("Audit result unknown");
+            }
+        });
+        String close = CccAuditLog.closeRecord("node", UUID.randomUUID(), UUID.randomUUID(),
+                UUID.randomUUID(), "a", "OPERATOR_REVOKED");
+        writer.start();
+        try {
+            writer.offer(close);
+            assertEquals(close, attempts.poll(3, TimeUnit.SECONDS));
+            assertEquals(close, attempts.poll(4, TimeUnit.SECONDS));
+        } finally {
+            writer.finish();
+            writer.awaitDrain();
+        }
     }
 
     @Test

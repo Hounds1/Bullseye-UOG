@@ -1,6 +1,7 @@
 package io.bullseye.uog.ccc;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -12,6 +13,8 @@ import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 
@@ -45,7 +48,17 @@ final class CccAuditLog {
             UUID sessionId,
             String certificateSha256,
             String reasonCode) throws IOException {
-        var entry = JSON.createObjectNode()
+        appendLine(record(event, nodeId, requestId, runId, sessionId, certificateSha256, reasonCode));
+    }
+
+    static String closeRecord(String nodeId, UUID requestId, UUID runId, UUID sessionId,
+            String certificateSha256, String reasonCode) {
+        return record("SESSION_CLOSED", nodeId, requestId, runId, sessionId, certificateSha256, reasonCode);
+    }
+
+    private static String record(String event, String nodeId, UUID requestId, UUID runId,
+            UUID sessionId, String certificateSha256, String reasonCode) {
+        return JSON.createObjectNode()
                 .put("eventId", UUID.randomUUID().toString())
                 .put("occurredAt", Instant.now().toString())
                 .put("event", Objects.requireNonNull(event, "event"))
@@ -54,13 +67,16 @@ final class CccAuditLog {
                 .put("runId", id(runId))
                 .put("sessionId", id(sessionId))
                 .put("certificateSha256", certificateSha256)
-                .put("reasonCode", reasonCode);
-        String line = JSON.writeValueAsString(entry) + "\n";
-        ByteBuffer bytes = ByteBuffer.wrap(line.getBytes(StandardCharsets.UTF_8));
+                .put("reasonCode", reasonCode)
+                .toString();
+    }
 
+    synchronized void appendLine(String line) throws IOException {
+        ByteBuffer bytes = ByteBuffer.wrap((line + "\n").getBytes(StandardCharsets.UTF_8));
         try (FileChannel channel = FileChannel.open(
                 file, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
-            long end = repairTail(channel);
+            long end = committedSize(channel);
+            channel.truncate(end);
             channel.position(end);
             try {
                 while (bytes.hasRemaining()) {
@@ -76,6 +92,63 @@ final class CccAuditLog {
                 }
                 throw failure;
             }
+        }
+    }
+
+    synchronized void reconcileSessions() throws IOException {
+        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ, StandardOpenOption.WRITE)) {
+            long end = committedSize(channel);
+            if (end < channel.size()) {
+                channel.truncate(end);
+                channel.force(true);
+            }
+        } catch (NoSuchFileException missing) {
+            return;
+        }
+
+        Map<UUID, ObjectNode> openSessions = new LinkedHashMap<>();
+        try (var reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                if (!(JSON.readTree(line) instanceof ObjectNode entry)) {
+                    throw new IOException("Invalid committed CCC audit record");
+                }
+                switch (entry.path("event").asText()) {
+                    case "JOIN_ACCEPTED" -> openSessions.put(requiredUuid(entry, "sessionId"), entry);
+                    case "SESSION_CLOSED" -> openSessions.remove(requiredUuid(entry, "sessionId"));
+                    default -> { }
+                }
+            }
+        }
+
+        for (var open : openSessions.entrySet()) {
+            ObjectNode entry = open.getValue();
+            appendLine(closeRecord(entry.path("nodeId").textValue(), requiredUuid(entry, "requestId"),
+                    requiredUuid(entry, "runId"), open.getKey(), entry.path("certificateSha256").textValue(),
+                    "RECOVERED_AFTER_RESTART"));
+        }
+    }
+
+    private static UUID requiredUuid(ObjectNode entry, String field) throws IOException {
+        String value = entry.path(field).textValue();
+        if (value != null) {
+            try {
+                UUID parsed = UUID.fromString(value);
+                if (parsed.toString().equals(value)) {
+                    return parsed;
+                }
+            } catch (IllegalArgumentException failure) {
+                // Report the field without disclosing its value.
+            }
+        }
+        throw new IOException("Invalid CCC audit " + field);
+    }
+
+    synchronized long committedSize() throws IOException {
+        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ)) {
+            return committedSize(channel);
+        } catch (NoSuchFileException missing) {
+            return 0;
         }
     }
 
@@ -114,7 +187,7 @@ final class CccAuditLog {
         }
     }
 
-    private static long repairTail(FileChannel channel) throws IOException {
+    private static long committedSize(FileChannel channel) throws IOException {
         long size = channel.size();
         if (size == 0 || newlineAt(channel, size - 1)) {
             return size;
@@ -128,14 +201,11 @@ final class CccAuditLog {
             readFully(channel, block, start);
             for (int index = block.limit() - 1; index >= 0; index--) {
                 if (block.get(index) == '\n') {
-                    long committed = start + index + 1;
-                    channel.truncate(committed);
-                    return committed;
+                    return start + index + 1;
                 }
             }
             end = start;
         }
-        channel.truncate(0);
         return 0;
     }
 

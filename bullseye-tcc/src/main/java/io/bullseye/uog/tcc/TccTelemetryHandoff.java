@@ -3,10 +3,12 @@ package io.bullseye.uog.tcc;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryIteratorException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Instant;
 import java.util.concurrent.ConcurrentHashMap;
 
 /** Retries archive delivery for committed latest and superseded TCC records. */
@@ -20,6 +22,8 @@ public final class TccTelemetryHandoff implements AutoCloseable {
         void store(String telemetryJson) throws IOException;
     }
 
+    public record Progress(long pendingLatest, Instant lastSuccessAt) {}
+
     private final Path latestDirectory;
     private final Path pendingDirectory;
     private final Sink sink;
@@ -27,6 +31,8 @@ public final class TccTelemetryHandoff implements AutoCloseable {
     private final Thread worker = Thread.ofPlatform().daemon().name("bullseye-tcc-telemetry-handoff")
             .unstarted(this::run);
     private volatile boolean closed;
+    private volatile Instant lastSuccessAt;
+    private volatile boolean openedLatestDirectory;
 
     TccTelemetryHandoff(Path latestDirectory, Sink sink) {
         this.latestDirectory = latestDirectory;
@@ -36,6 +42,32 @@ public final class TccTelemetryHandoff implements AutoCloseable {
 
     public static Path pendingDirectory(Path latestDirectory) {
         return latestDirectory.resolve(".amc-pending");
+    }
+
+    /** Samples current latest files without taking the receiver's write lock. */
+    Progress progress() throws IOException {
+        DirectoryStream<Path> latestFiles;
+        try {
+            latestFiles = Files.newDirectoryStream(latestDirectory, "*.json");
+        } catch (NoSuchFileException empty) {
+            if (openedLatestDirectory) {
+                throw empty;
+            }
+            return new Progress(0, lastSuccessAt);
+        }
+        long pendingLatest = 0;
+        try (latestFiles) {
+            openedLatestDirectory = true;
+            for (Path file : latestFiles) {
+                String digest = TccReceiver.sha256(Files.readAllBytes(file));
+                if (!digest.equals(delivered.get(file))) {
+                    pendingLatest++;
+                }
+            }
+        } catch (DirectoryIteratorException failure) {
+            throw failure.getCause();
+        }
+        return new Progress(pendingLatest, lastSuccessAt);
     }
 
     /**
@@ -105,6 +137,9 @@ public final class TccTelemetryHandoff implements AutoCloseable {
     private IOException deliverDirectory(Path directory, boolean pending) {
         IOException firstFailure = null;
         try (var files = Files.newDirectoryStream(directory, "*.json")) {
+            if (!pending) {
+                openedLatestDirectory = true;
+            }
             for (Path file : files) {
                 if (closed) {
                     break;
@@ -118,7 +153,7 @@ public final class TccTelemetryHandoff implements AutoCloseable {
                 }
             }
         } catch (NoSuchFileException missing) {
-            return pending ? null : missing;
+            return pending || !openedLatestDirectory ? null : missing;
         } catch (DirectoryIteratorException failure) {
             return failure.getCause();
         } catch (IOException failure) {
@@ -131,6 +166,7 @@ public final class TccTelemetryHandoff implements AutoCloseable {
         byte[] contents = Files.readAllBytes(file);
         if (pending) {
             sink.store(new String(contents, StandardCharsets.UTF_8));
+            lastSuccessAt = Instant.now();
             Files.deleteIfExists(file);
             return;
         }
@@ -138,6 +174,7 @@ public final class TccTelemetryHandoff implements AutoCloseable {
         String digest = TccReceiver.sha256(contents);
         if (!digest.equals(delivered.get(file))) {
             sink.store(new String(contents, StandardCharsets.UTF_8));
+            lastSuccessAt = Instant.now();
             delivered.put(file, digest);
         }
     }

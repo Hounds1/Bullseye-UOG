@@ -16,10 +16,12 @@ import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 final class CccProtocol {
     private static final int VERSION = 1;
     private static final int MAX_FRAME_BYTES = 65_536;
+    private static final Pattern REASON_CODE = Pattern.compile("[A-Z][A-Z0-9_]{0,63}");
     private static final ObjectMapper JSON = new ObjectMapper()
             .enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION)
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
@@ -60,6 +62,19 @@ final class CccProtocol {
 
     static void writePing(OutputStream output, long sequence) throws IOException {
         write(output, message("PING").put("sequence", sequence));
+    }
+
+    static boolean validReasonCode(String reasonCode) {
+        return reasonCode != null && REASON_CODE.matcher(reasonCode).matches();
+    }
+
+    static void writeRevoked(OutputStream output, String reasonCode, Integer retryAfterMs)
+            throws IOException {
+        ObjectNode response = message("SESSION_REVOKED").put("reasonCode", reasonCode);
+        if (retryAfterMs != null) {
+            response.put("retryAfterMs", retryAfterMs);
+        }
+        write(output, response);
     }
 
     static void readPong(InputStream input, long expectedSequence) throws IOException {

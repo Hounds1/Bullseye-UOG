@@ -12,17 +12,28 @@ schema and diagnostic data, and responds with `TCC_ACK` carrying the
 snapshot's `sequence`. Valid initializing and stale observations can be
 stored. CCC continues to handle heartbeat traffic during TCC processing.
 
+Incoming snapshots must cover the same resources in observations and
+diagnoses. Each fresh observation requires a sample timestamp. The summary
+follows resource status in priority order from stale to initializing to fresh.
+An empty observation set is initializing. A matching retry of a record
+stored before these checks still returns `DUPLICATE`.
+
 | ACK status | UOG meaning |
 | --- | --- |
 | `ACCEPTED` | The eligible snapshot passed validation and committed to the node's local latest-record store. |
 | `DUPLICATE` | The same record and content are already stored for the node. |
 | `REJECTED` | The record is invalid, has an inactive or different session identity, or conflicts with the remembered ordering or content. |
-| `RETRYABLE` | A local write failed while replacing the latest record or preserving its predecessor for archive delivery. |
+| `RETRYABLE` | TCC could not access its local store, write the latest record, or preserve its predecessor for archive delivery. |
 
 Each node has one stored JSON object named by the SHA-256 hash of its
 `nodeId`. TCC atomically replaces that file and checks the stored record
 on retries and after restart. A newly admitted run may restart sequencing.
 Use one UOG process per store directory.
+
+CCC can start while the TCC storage path is unavailable. TCC opens its store
+on receipt of a valid snapshot from an active session and creates the
+directory if it is missing. Storage errors return `RETRYABLE` and subsequent
+receives can recover when the path becomes available.
 
 ## Archive handoff
 

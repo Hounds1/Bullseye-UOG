@@ -38,9 +38,8 @@ public final class TccReceiver implements AutoCloseable {
     }
 
     public TccReceiver(Path latestDirectory, TccTelemetryHandoff.Sink archive) throws IOException {
-        this.latestDirectory = Files.createDirectories(
-                Objects.requireNonNull(latestDirectory, "latestDirectory")
-                        .toAbsolutePath().normalize());
+        this.latestDirectory = Objects.requireNonNull(latestDirectory, "latestDirectory")
+                .toAbsolutePath().normalize();
         this.handoff = archive == null ? null : new TccTelemetryHandoff(this.latestDirectory, archive);
     }
 
@@ -48,6 +47,13 @@ public final class TccReceiver implements AutoCloseable {
         if (handoff != null) {
             handoff.start();
         }
+    }
+
+    public TccTelemetryHandoff.Progress handoffProgress() throws IOException {
+        if (handoff == null) {
+            throw new IOException("TCC telemetry handoff is disabled");
+        }
+        return handoff.progress();
     }
 
     @Override
@@ -81,23 +87,33 @@ public final class TccReceiver implements AutoCloseable {
             return acknowledgement(sequence, "REJECTED", "INVALID_TELEMETRY");
         }
 
+        boolean consistent = TccSnapshotV1.consistentObservations(telemetry.path("snapshot"));
         Path latestFile = latestDirectory.resolve(fileName(nodeId));
         synchronized (storeLock) {
             if (!sessionActive.getAsBoolean()) {
                 return acknowledgement(sequence, "REJECTED", "SESSION_INACTIVE");
             }
             try {
+                if (consistent) {
+                    Files.createDirectories(latestDirectory);
+                }
                 StoredTelemetry previous = readLatest(latestFile, nodeId);
                 ObjectNode latest = previous == null ? null : previous.telemetry();
-                if (latest != null && expectedRunId.equals(latest.path("runId").textValue())) {
-                    long latestSequence = TccSnapshotV1.sequence(latest);
+                boolean sameRun = latest != null && expectedRunId.equals(latest.path("runId").textValue());
+                long latestSequence = sameRun ? TccSnapshotV1.sequence(latest) : 0;
+                // An older accepted record can predate the current observation checks.
+                if (sameRun && sequence == latestSequence && compatible(telemetry, latest)) {
+                    return acknowledgement(sequence, "DUPLICATE", null);
+                }
+                if (!consistent) {
+                    return acknowledgement(sequence, "REJECTED", "INVALID_TELEMETRY");
+                }
+                if (sameRun) {
                     if (sequence < latestSequence) {
                         return acknowledgement(sequence, "REJECTED", "SEQUENCE_OLDER");
                     }
                     if (sequence == latestSequence) {
-                        return compatible(telemetry, latest)
-                                ? acknowledgement(sequence, "DUPLICATE", null)
-                                : acknowledgement(sequence, "REJECTED", "SEQUENCE_CONFLICT");
+                        return acknowledgement(sequence, "REJECTED", "SEQUENCE_CONFLICT");
                     }
                     if (timelineRegressed(telemetry.path("snapshot"), latest.path("snapshot"))) {
                         return acknowledgement(sequence, "REJECTED", "TIMELINE_REGRESSION");
