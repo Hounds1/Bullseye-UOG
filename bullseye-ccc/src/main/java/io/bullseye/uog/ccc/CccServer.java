@@ -1,5 +1,6 @@
 package io.bullseye.uog.ccc;
 
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.bullseye.uog.ccc.CccProtocol.JoinRequest;
 
 import javax.net.ssl.SSLContext;
@@ -27,12 +28,20 @@ import java.util.UUID;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.regex.Pattern;
 
 public final class CccServer implements AutoCloseable {
     private static final System.Logger LOGGER = System.getLogger(CccServer.class.getName());
     private static final Pattern CERTIFICATE_SHA256 = Pattern.compile("[0-9a-fA-F]{64}");
+
+    @FunctionalInterface
+    public interface SessionHandler {
+        ObjectNode handle(String nodeId, UUID runId, ObjectNode frame, BooleanSupplier sessionActive)
+                throws IOException;
+    }
 
     public record Settings(
             InetSocketAddress address,
@@ -62,6 +71,9 @@ public final class CccServer implements AutoCloseable {
     private final Settings settings;
     private final CccAuditLog audit;
     private final ScheduledThreadPoolExecutor deadlines;
+    private final String applicationCapability;
+    private final SessionHandler applicationHandler;
+    private final Semaphore applicationSlots;
     private final Thread acceptor;
     private final Object lock = new Object();
     private final Set<Socket> connections = new HashSet<>();
@@ -71,8 +83,20 @@ public final class CccServer implements AutoCloseable {
     private boolean shutdownCompleted;
 
     public CccServer(SSLContext tls, Settings settings) throws IOException {
+        this(tls, settings, null, null);
+    }
+
+    public CccServer(SSLContext tls, Settings settings, String applicationCapability,
+            SessionHandler handler) throws IOException {
+        if ((handler == null) != (applicationCapability == null)
+                || (applicationCapability != null && applicationCapability.isBlank())) {
+            throw new IllegalArgumentException("CCC application capability and handler must be supplied together");
+        }
         tlsFactory = Objects.requireNonNull(tls, "tls").getSocketFactory();
         this.settings = Objects.requireNonNull(settings, "settings");
+        this.applicationCapability = applicationCapability;
+        applicationHandler = handler;
+        applicationSlots = handler == null ? null : new Semaphore(settings.maxConnections());
         audit = new CccAuditLog(settings.auditFile());
         listener = new ServerSocket();
         try {
@@ -205,13 +229,20 @@ public final class CccServer implements AutoCloseable {
                 appendAudit("JOIN_ACCEPTED", join, sessionId, fingerprint, null);
                 accepted = true;
                 requireWithin(admissionStartedAt, settings.admissionTimeoutMillis());
-                CccProtocol.writeAccepted(output, join.requestId(), sessionId, settings.heartbeatMillis());
+                CccProtocol.writeAccepted(output, join.requestId(), sessionId,
+                        settings.heartbeatMillis(), applicationCapability);
                 joined = true;
             } finally {
                 admissionDeadline.cancel(false);
             }
-            channel.setSoTimeout(settings.heartbeatMillis());
-            maintainSession(transport, input, output);
+            if (applicationHandler == null) {
+                channel.setSoTimeout(settings.heartbeatMillis());
+                maintainSession(transport, input, output);
+            } else {
+                channel.setSoTimeout(0);
+                new CccApplicationSession(transport, input, output, join, applicationHandler,
+                        applicationSlots, deadlines, settings.heartbeatMillis()).run();
+            }
         } catch (SocketTimeoutException failure) {
             closeReason = joined ? "HEARTBEAT_TIMEOUT" : "ADMISSION_TIMEOUT";
         } catch (InterruptedException stopping) {

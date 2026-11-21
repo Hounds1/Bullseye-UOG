@@ -4,6 +4,7 @@ plugins {
 
 dependencies {
     implementation project(':bullseye-ccc')
+    implementation project(':bullseye-tcc')
 }
 
 application {
@@ -15,6 +16,7 @@ distributions {
     main {
         distributionBaseName = 'bullseye-uog'
         contents {
+            from(rootProject.file('LICENSE'))
             from(rootProject.file('config/bullseye-uog.properties')) {
                 into 'config'
             }

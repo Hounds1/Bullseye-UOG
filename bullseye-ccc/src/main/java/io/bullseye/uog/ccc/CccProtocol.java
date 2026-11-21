@@ -29,17 +29,22 @@ final class CccProtocol {
     record JoinRequest(String nodeId, UUID requestId, UUID runId) {}
 
     static JoinRequest readJoin(InputStream input) throws IOException {
-        ObjectNode message = read(input, "JOIN_REQUEST");
+        ObjectNode message = readFrame(input);
+        requireType(message, "JOIN_REQUEST");
         return new JoinRequest(
                 text(message, "nodeId"), uuid(message, "requestId"), uuid(message, "runId"));
     }
 
-    static void writeAccepted(OutputStream output, UUID requestId, UUID sessionId, int interval)
-            throws IOException {
-        write(output, message("JOIN_ACCEPTED")
+    static void writeAccepted(OutputStream output, UUID requestId, UUID sessionId, int interval,
+            String applicationCapability) throws IOException {
+        ObjectNode response = message("JOIN_ACCEPTED")
                 .put("requestId", requestId.toString())
                 .put("sessionId", sessionId.toString())
-                .put("heartbeatIntervalMs", interval));
+                .put("heartbeatIntervalMs", interval);
+        if (applicationCapability != null) {
+            response.putArray("capabilities").add(applicationCapability);
+        }
+        write(output, response);
     }
 
     static void writeRejected(OutputStream output, UUID requestId, String reason, Integer retryMillis)
@@ -58,14 +63,20 @@ final class CccProtocol {
     }
 
     static void readPong(InputStream input, long expectedSequence) throws IOException {
-        JsonNode sequence = read(input, "PONG").path("sequence");
+        ObjectNode message = readFrame(input);
+        requireType(message, "PONG");
+        requirePongSequence(message, expectedSequence);
+    }
+
+    static void requirePongSequence(ObjectNode message, long expectedSequence) throws IOException {
+        JsonNode sequence = message.path("sequence");
         if (!sequence.isIntegralNumber() || !sequence.canConvertToLong()
                 || sequence.longValue() != expectedSequence) {
             throw new IOException("Unexpected CCC heartbeat sequence");
         }
     }
 
-    private static ObjectNode read(InputStream input, String expectedType) throws IOException {
+    static ObjectNode readFrame(InputStream input) throws IOException {
         DataInputStream frame = new DataInputStream(input);
         int length = frame.readInt();
         requireFrameLength(length);
@@ -88,14 +99,40 @@ final class CccProtocol {
         if (!(parsed instanceof ObjectNode message)) {
             throw new IOException("Expected a CCC JSON object");
         }
+        validateEnvelope(message);
+        return message;
+    }
+
+    static String type(ObjectNode message) throws IOException {
+        return text(message, "type");
+    }
+
+    static boolean controlType(String type) {
+        return switch (type) {
+            case "JOIN_REQUEST", "JOIN_ACCEPTED", "JOIN_REJECTED", "PING", "PONG", "SESSION_REVOKED" -> true;
+            default -> false;
+        };
+    }
+
+    static void writeApplicationResponse(OutputStream output, ObjectNode message) throws IOException {
+        if (message == null || controlType(validateEnvelope(message))) {
+            throw new IOException("Invalid CCC application response");
+        }
+        write(output, message);
+    }
+
+    private static String validateEnvelope(ObjectNode message) throws IOException {
         JsonNode version = message.path("protocolVersion");
         if (!version.isIntegralNumber() || !version.canConvertToInt() || version.intValue() != VERSION) {
             throw new IOException("Unsupported CCC protocol version");
         }
-        if (!expectedType.equals(text(message, "type"))) {
+        return type(message);
+    }
+
+    private static void requireType(ObjectNode message, String expectedType) throws IOException {
+        if (!expectedType.equals(type(message))) {
             throw new IOException("Unexpected CCC message type");
         }
-        return message;
     }
 
     private static String text(ObjectNode message, String field) throws IOException {
