@@ -48,7 +48,7 @@ public final class UogApplication {
         try (var tcc = createTcc(properties, archiveEnabled);
                 var server = createServer(SSLContext.getDefault(), settings, tcc);
                 var handoff = createAuditHandoff(server, settings, properties, archiveEnabled);
-                var capacity = createCapacityMonitor(settings, properties, archiveEnabled)) {
+                var capacity = createCapacityMonitor(settings, properties, handoff, tcc)) {
             Runtime.getRuntime().addShutdownHook(
                     new Thread(() -> shutdown(server, handoff, tcc, capacity), "bullseye-uog-shutdown"));
             if (handoff != null) {
@@ -98,8 +98,8 @@ public final class UogApplication {
     }
 
     private static AmcCapacityMonitor createCapacityMonitor(
-            CccServer.Settings settings, Properties properties, boolean archiveEnabled) {
-        if (!archiveEnabled || !enabled(properties, CAPACITY_PREFIX + "enabled")) {
+            CccServer.Settings settings, Properties properties, CccAuditHandoff handoff, TccReceiver tcc) {
+        if (handoff == null || !enabled(properties, CAPACITY_PREFIX + "enabled")) {
             return null;
         }
 
@@ -120,7 +120,20 @@ public final class UogApplication {
                 "tccArchive", tccArchive,
                 "cccSource", cccSource,
                 "tccPending", tccPending);
-        return new AmcCapacityMonitor(sources, volumes, interval, minimumBytes);
+        Map<String, AmcCapacityMonitor.HandoffProbe> handoffs = new HashMap<>();
+        handoffs.put("cccHandoff", () -> {
+            var progress = handoff.progress();
+            return new AmcCapacityMonitor.HandoffLag(
+                    "pendingBytes", progress.pendingBytes(), progress.lastSuccessAt());
+        });
+        if (tcc != null) {
+            handoffs.put("tccHandoff", () -> {
+                var progress = tcc.handoffProgress();
+                return new AmcCapacityMonitor.HandoffLag("pendingLatest", progress.pendingLatest(),
+                        progress.lastSuccessAt());
+            });
+        }
+        return new AmcCapacityMonitor(sources, volumes, handoffs, interval, minimumBytes);
     }
 
     private static Path auditArchiveDirectory(Properties properties) {

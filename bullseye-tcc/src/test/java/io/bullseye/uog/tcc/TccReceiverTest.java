@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -34,6 +35,51 @@ class TccReceiverTest {
     private static final UUID NEXT_RUN = UUID.fromString("4bc0fb0c-159f-4165-b000-4e2e377ac3c7");
 
     @TempDir Path latestDirectory;
+
+    @Test
+    void createsStoreOnlyForValidActiveTelemetryAndThenDeliversToArchive() throws Exception {
+        Path store = latestDirectory.resolve("not-created/latest");
+        ObjectNode first = fixture("initializing");
+        var archived = new CompletableFuture<ObjectNode>();
+        try (var receiver = new TccReceiver(store,
+                json -> archived.complete((ObjectNode) JSON.readTree(json)))) {
+            receiver.startHandoff();
+            assertFalse(Files.exists(store.getParent()));
+
+            ObjectNode wrongVersion = first.deepCopy().put("schemaVersion", 2);
+            assertAck(receiver.receive(NODE, RUN, frame(wrongVersion), () -> true),
+                    1, "REJECTED", "INVALID_TELEMETRY");
+            assertAck(receiver.receive(NODE, RUN, frame(first), () -> false),
+                    1, "REJECTED", "SESSION_INACTIVE");
+            assertFalse(Files.exists(store.getParent()));
+
+            assertAck(receiver.receive(NODE, RUN, frame(first), () -> true), 1, "ACCEPTED", null);
+            assertEquals(first, archived.get(5, TimeUnit.SECONDS));
+        }
+    }
+
+    @Test
+    void recoversUnavailableOrRemovedStoreWithoutRestartingReceiver() throws Exception {
+        Path store = Files.writeString(latestDirectory.resolve("blocked"), "blocking file");
+        ObjectNode first = fixture("initializing");
+        ObjectNode second = fixture("evaluated");
+        Path stored = store.resolve(latestFile(NODE).getFileName());
+
+        try (var receiver = new TccReceiver(store)) {
+            assertAck(receiver.receive(NODE, RUN, frame(first), () -> true),
+                    1, "RETRYABLE", "PERSISTENCE_UNAVAILABLE");
+            assertEquals("blocking file", Files.readString(store));
+
+            Files.delete(store);
+            assertAck(receiver.receive(NODE, RUN, frame(first), () -> true), 1, "ACCEPTED", null);
+            assertEquals(first, JSON.readTree(Files.readString(stored)));
+
+            Files.delete(stored);
+            Files.delete(store);
+            assertAck(receiver.receive(NODE, RUN, frame(second), () -> true), 2, "ACCEPTED", null);
+            assertEquals(second, JSON.readTree(Files.readString(stored)));
+        }
+    }
 
     @Test
     void acceptsCoreFixturesIncludingInitializingStaleAndWallClockBacksteps() throws Exception {
@@ -50,6 +96,82 @@ class TccReceiverTest {
         assertEquals(evaluated, JSON.readTree(Files.readString(latest)));
         try (var files = Files.list(latestDirectory)) {
             assertEquals(List.of(latest), files.toList());
+        }
+    }
+
+    @Test
+    void rejectsInconsistentObservationFieldsWithoutCreatingTheStore() throws Exception {
+        Path store = latestDirectory.resolve("not-created");
+        var receiver = new TccReceiver(store);
+        ObjectNode evaluated = fixture("evaluated");
+        List<Consumer<ObjectNode>> contradictions = List.of(
+                telemetry -> snapshot(telemetry).put("observationStatus", "FRESH"),
+                telemetry -> object(object(snapshot(telemetry), "observations"), "HOST_CPU")
+                        .putNull("lastSampleAt"),
+                telemetry -> object(snapshot(telemetry), "observations").remove("HOST_CPU"),
+                telemetry -> {
+                    object(snapshot(telemetry), "observations").remove("HOST_CPU");
+                    object(snapshot(telemetry), "resources").remove("DISK_IO");
+                });
+        for (Consumer<ObjectNode> change : contradictions) {
+            ObjectNode invalid = evaluated.deepCopy();
+            change.accept(invalid);
+            assertAck(receiver.receive(NODE, RUN, frame(invalid), () -> true),
+                    2, "REJECTED", "INVALID_TELEMETRY");
+        }
+        assertFalse(Files.exists(store));
+    }
+
+    @Test
+    void acceptsConsistentInitializingStaleAndFreshObservations() throws Exception {
+        var receiver = new TccReceiver(latestDirectory);
+        ObjectNode warmingUp = fixture("evaluated");
+        snapshot(warmingUp).put("observationStatus", "INITIALIZING");
+        ObjectNode observations = object(snapshot(warmingUp), "observations");
+        object(observations, "DISK_IO").put("status", "INITIALIZING").putNull("lastSampleAt");
+        assertAck(receiver.receive(NODE, RUN, frame(warmingUp), () -> true), 2, "ACCEPTED", null);
+
+        ObjectNode stale = warmingUp.deepCopy().put("sequence", 3);
+        snapshot(stale).put("observationStatus", "STALE");
+        ObjectNode staleObservations = object(snapshot(stale), "observations");
+        object(staleObservations, "HOST_CPU").put("status", "STALE")
+                .putNull("lastSampleAt").putArray("metrics");
+        assertAck(receiver.receive(NODE, RUN, frame(stale), () -> true), 3, "ACCEPTED", null);
+
+        ObjectNode fresh = fixture("evaluated").put("sequence", 4);
+        snapshot(fresh).put("observationStatus", "FRESH");
+        ObjectNode io = object(object(snapshot(fresh), "observations"), "DISK_IO");
+        io.put("status", "FRESH").put("lastSampleAt", 1_950);
+        io.putArray("metrics").addObject().put("metric", "HOST_IO_PSI_SOME_AVG10")
+                .put("value", 12.5).put("unit", "%");
+        assertAck(receiver.receive(NODE, RUN, frame(fresh), () -> true), 4, "ACCEPTED", null);
+    }
+
+    @Test
+    void keepsLegacyStoredRecordReplayableAndCanReplaceItWithConsistentTelemetry() throws Exception {
+        ObjectNode legacy = fixture("evaluated");
+        snapshot(legacy).put("observationStatus", "FRESH");
+        Path stored = latestFile(NODE);
+        String contents = JSON.writeValueAsString(legacy);
+        Files.writeString(stored, contents);
+
+        try (var receiver = new TccReceiver(latestDirectory, ignored -> {})) {
+            assertAck(receiver.receive(NODE, RUN, frame(legacy), () -> true), 2, "DUPLICATE", null);
+            assertEquals(contents, Files.readString(stored));
+            assertFalse(Files.exists(TccTelemetryHandoff.pendingDirectory(latestDirectory)));
+
+            ObjectNode changed = legacy.deepCopy();
+            snapshot(changed).put("host", "changed");
+            assertAck(receiver.receive(NODE, RUN, frame(changed), () -> true),
+                    2, "REJECTED", "INVALID_TELEMETRY");
+
+            ObjectNode corrected = fixture("evaluated");
+            assertAck(receiver.receive(NODE, RUN, frame(corrected), () -> true),
+                    2, "REJECTED", "SEQUENCE_CONFLICT");
+            corrected.put("sequence", 3);
+            assertAck(receiver.receive(NODE, RUN, frame(corrected), () -> true),
+                    3, "ACCEPTED", null);
+            assertEquals(corrected, JSON.readTree(Files.readString(stored)));
         }
     }
 

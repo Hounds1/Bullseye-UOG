@@ -10,6 +10,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Objects;
 
 /** Delivers durable CCC audit lines in order with at-least-once delivery. */
@@ -23,6 +24,10 @@ public final class CccAuditHandoff implements AutoCloseable {
         void store(String eventJson) throws IOException;
     }
 
+    public record Progress(long pendingBytes, Instant lastSuccessAt) {}
+
+    private record CommittedCheckpoint(long offset, Instant lastSuccessAt) {}
+
     private final CccAuditLog audit;
     private final Path checkpoint;
     private final Sink sink;
@@ -31,6 +36,7 @@ public final class CccAuditHandoff implements AutoCloseable {
     private final Thread worker = Thread.ofPlatform().daemon().name("bullseye-ccc-audit-handoff")
             .unstarted(this::run);
     private volatile boolean closed;
+    private volatile CommittedCheckpoint committedCheckpoint;
 
     CccAuditHandoff(CccAuditLog audit, Path checkpoint, Sink sink) {
         this(audit, checkpoint, sink, DEFAULT_POLL_MILLIS);
@@ -66,6 +72,19 @@ public final class CccAuditHandoff implements AutoCloseable {
         }
     }
 
+    /** Returns committed source bytes beyond the handoff's durable checkpoint. */
+    public Progress progress() throws IOException {
+        CommittedCheckpoint checkpointState = committedCheckpoint;
+        if (checkpointState == null) {
+            throw new IOException("CCC audit handoff checkpoint is not initialized");
+        }
+        long sourceBytes = audit.committedSize();
+        if (sourceBytes < checkpointState.offset()) {
+            throw new IOException("CCC audit source is behind its handoff checkpoint");
+        }
+        return new Progress(sourceBytes - checkpointState.offset(), checkpointState.lastSuccessAt());
+    }
+
     private void run() {
         long offset = -1;
         boolean interrupted = false;
@@ -74,12 +93,14 @@ public final class CccAuditHandoff implements AutoCloseable {
                 if (offset < 0) {
                     prepareCheckpoint();
                     offset = loadCheckpoint();
+                    committedCheckpoint = new CommittedCheckpoint(offset, null);
                 }
                 CccAuditLog.CommittedLine line = audit.readCommitted(offset);
                 if (line != null && !closed) {
                     sink.store(line.json());
                     saveCheckpoint(line.nextOffset());
                     offset = line.nextOffset();
+                    committedCheckpoint = new CommittedCheckpoint(offset, Instant.now());
                     interrupted = false;
                     continue;
                 }

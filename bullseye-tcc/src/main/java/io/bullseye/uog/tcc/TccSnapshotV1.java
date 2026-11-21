@@ -56,6 +56,33 @@ final class TccSnapshotV1 {
                 && resources(snapshot.path("resources"), evaluation);
     }
 
+    static boolean consistentObservations(JsonNode snapshot) {
+        JsonNode observations = snapshot.path("observations");
+        JsonNode diagnoses = snapshot.path("resources");
+        if (observations.size() != diagnoses.size()) {
+            return false;
+        }
+
+        boolean allFresh = !observations.isEmpty();
+        boolean anyStale = false;
+        for (var entry : observations.properties()) {
+            JsonNode observation = entry.getValue();
+            String status = observation.path("status").textValue();
+            boolean fresh = "FRESH".equals(status);
+            if (!diagnoses.has(entry.getKey()) || (fresh && !observation.hasNonNull("lastSampleAt"))) {
+                return false;
+            }
+            allFresh &= fresh;
+            anyStale |= "STALE".equals(status);
+        }
+
+        String expected = allFresh ? "FRESH" : "INITIALIZING";
+        if (anyStale) {
+            expected = "STALE";
+        }
+        return expected.equals(snapshot.path("observationStatus").textValue());
+    }
+
     private static boolean diagnosis(JsonNode node, long evaluatedAt) {
         return node.isObject()
                 && oneOf(node.path("severity"), SEVERITIES)

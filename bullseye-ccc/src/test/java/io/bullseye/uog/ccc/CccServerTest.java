@@ -42,6 +42,8 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 @Timeout(15)
 class CccServerTest {
@@ -153,6 +155,54 @@ class CccServerTest {
             finish.countDown();
         }
         assertFalse(sessionActive.get().getAsBoolean());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void explicitlyRevokesTheExactSessionAndAuditsItsReason(boolean applicationEnabled)
+            throws Exception {
+        CccServer.SessionHandler handler = applicationEnabled
+                ? (node, run, frame, active) -> message("APP_ACK") : null;
+        Integer retryAfter = applicationEnabled ? 750 : null;
+        UUID revokedSession;
+        try (CccServer server = server(handler)) {
+            try (SSLSocket connection = connect(server, registeredClient)) {
+                send(connection, join(NODE_ID));
+                JsonNode approval = read(connection);
+                assertEquals("JOIN_ACCEPTED", approval.path("type").textValue());
+                revokedSession = UUID.fromString(approval.path("sessionId").textValue());
+                assertThrows(IllegalArgumentException.class,
+                        () -> server.revokeSession(NODE_ID, revokedSession, "invalid\nreason", null));
+                assertThrows(IllegalArgumentException.class,
+                        () -> server.revokeSession(NODE_ID, revokedSession, "OPERATOR_REVOKED", -1));
+                assertFalse(server.revokeSession("another-node", revokedSession, "OPERATOR_REVOKED", null));
+                assertTrue(server.revokeSession(NODE_ID, revokedSession, "OPERATOR_REVOKED", retryAfter));
+
+                JsonNode revoked = read(connection);
+                if ("PING".equals(revoked.path("type").textValue())) {
+                    revoked = read(connection);
+                }
+                assertEquals("SESSION_REVOKED", revoked.path("type").textValue());
+                assertEquals("OPERATOR_REVOKED", revoked.path("reasonCode").textValue());
+                if (retryAfter == null) {
+                    assertFalse(revoked.has("retryAfterMs"));
+                } else {
+                    assertEquals(retryAfter.intValue(), revoked.path("retryAfterMs").intValue());
+                }
+                assertSessionEnded(connection);
+            }
+            JsonNode closed = awaitAudit(3).getLast();
+            assertEquals("SESSION_CLOSED", closed.path("event").textValue());
+            assertEquals(revokedSession.toString(), closed.path("sessionId").textValue());
+            assertEquals("OPERATOR_REVOKED", closed.path("reasonCode").textValue());
+
+            try (SSLSocket replacement = connect(server, registeredClient)) {
+                send(replacement, join(NODE_ID));
+                assertEquals("JOIN_ACCEPTED", read(replacement).path("type").textValue());
+                assertFalse(server.revokeSession(NODE_ID, revokedSession, "OPERATOR_REVOKED", null));
+                replyToPing(replacement);
+            }
+        }
     }
 
     @Test

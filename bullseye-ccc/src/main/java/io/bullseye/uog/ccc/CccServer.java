@@ -19,6 +19,7 @@ import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.cert.Certificate;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.Map;
@@ -70,6 +71,7 @@ public final class CccServer implements AutoCloseable {
     private final SSLSocketFactory tlsFactory;
     private final Settings settings;
     private final CccAuditLog audit;
+    private final CccCloseAudit closeAudit;
     private final ScheduledThreadPoolExecutor deadlines;
     private final String applicationCapability;
     private final SessionHandler applicationHandler;
@@ -77,7 +79,7 @@ public final class CccServer implements AutoCloseable {
     private final Thread acceptor;
     private final Object lock = new Object();
     private final Set<Socket> connections = new HashSet<>();
-    private final Set<String> activeNodes = new HashSet<>();
+    private final Map<String, SessionControl> sessions = new HashMap<>();
     private boolean accepting;
     private boolean closed;
     private boolean shutdownCompleted;
@@ -98,9 +100,11 @@ public final class CccServer implements AutoCloseable {
         applicationHandler = handler;
         applicationSlots = handler == null ? null : new Semaphore(settings.maxConnections());
         audit = new CccAuditLog(settings.auditFile());
+        closeAudit = new CccCloseAudit(audit::appendLine);
         listener = new ServerSocket();
         try {
             listener.bind(settings.address());
+            audit.reconcileSessions();
         } catch (IOException | RuntimeException failure) {
             closeQuietly(listener);
             throw failure;
@@ -116,6 +120,7 @@ public final class CccServer implements AutoCloseable {
         synchronized (lock) {
             if (!closed && !accepting) {
                 accepting = true;
+                closeAudit.start();
                 acceptor.start();
             }
         }
@@ -129,12 +134,34 @@ public final class CccServer implements AutoCloseable {
         return new CccAuditHandoff(audit, checkpoint, sink);
     }
 
+    /** Selects a live session for revocation. Delivery of the final frame is best effort. */
+    public boolean revokeSession(String nodeId, UUID sessionId, String reasonCode, Integer retryAfterMs) {
+        Objects.requireNonNull(nodeId, "nodeId");
+        Objects.requireNonNull(sessionId, "sessionId");
+        if (!CccProtocol.validReasonCode(reasonCode) || (retryAfterMs != null && retryAfterMs < 0)) {
+            throw new IllegalArgumentException("Invalid CCC revocation reason or retry delay");
+        }
+
+        synchronized (lock) {
+            SessionControl session = sessions.get(nodeId);
+            if (closed || session == null || !session.admitted || session.transport.isClosed()
+                    || !session.id.equals(sessionId) || session.revocationReason != null) {
+                return false;
+            }
+            session.revocationReason = reasonCode;
+            Thread.ofVirtual().name("bullseye-ccc-revocation")
+                    .start(() -> sendRevocation(session, reasonCode, retryAfterMs));
+            return true;
+        }
+    }
+
     public void awaitTermination() throws InterruptedException {
         synchronized (lock) {
             while (!shutdownCompleted || accepting || !connections.isEmpty()) {
                 lock.wait();
             }
         }
+        closeAudit.awaitDrain();
     }
 
     @Override
@@ -153,7 +180,7 @@ public final class CccServer implements AutoCloseable {
         deadlines.shutdownNow();
         synchronized (lock) {
             shutdownCompleted = true;
-            lock.notifyAll();
+            signalTermination();
         }
     }
 
@@ -178,9 +205,16 @@ public final class CccServer implements AutoCloseable {
             close();
             synchronized (lock) {
                 accepting = false;
-                lock.notifyAll();
+                signalTermination();
             }
         }
+    }
+
+    private void signalTermination() {
+        if (shutdownCompleted && !accepting && connections.isEmpty()) {
+            closeAudit.finish();
+        }
+        lock.notifyAll();
     }
 
     private boolean startConnection(Socket transport) {
@@ -204,7 +238,7 @@ public final class CccServer implements AutoCloseable {
     private void serve(Socket transport) {
         SSLSocket channel = null;
         JoinRequest join = null;
-        UUID sessionId = null;
+        SessionControl session = null;
         String fingerprint = null;
         String closeReason = "CONNECTION_CLOSED";
         boolean accepted = false;
@@ -225,27 +259,37 @@ public final class CccServer implements AutoCloseable {
                     reject(output, join, fingerprint, "UNAUTHORIZED_NODE", null);
                     return;
                 }
-                if (!claimNode(join.nodeId())) {
+                var proposed = new SessionControl(UUID.randomUUID(), transport, output);
+                if (!claimNode(join.nodeId(), proposed)) {
                     reject(output, join, fingerprint, "NODE_ALREADY_CONNECTED", settings.heartbeatMillis());
                     return;
                 }
-                sessionId = UUID.randomUUID();
-                appendAudit("JOIN_ACCEPTED", join, sessionId, fingerprint, null);
+                session = proposed;
+                appendAudit("JOIN_ACCEPTED", join, session.id, fingerprint, null);
                 accepted = true;
                 requireWithin(admissionStartedAt, settings.admissionTimeoutMillis());
-                CccProtocol.writeAccepted(output, join.requestId(), sessionId,
-                        settings.heartbeatMillis(), applicationCapability);
+                synchronized (session.writeLock) {
+                    synchronized (lock) {
+                        if (closed) {
+                            throw new SocketException("CCC is closing");
+                        }
+                        session.admitted = true;
+                    }
+                    CccProtocol.writeAccepted(output, join.requestId(), session.id,
+                            settings.heartbeatMillis(), applicationCapability);
+                }
                 joined = true;
             } finally {
                 admissionDeadline.cancel(false);
             }
             if (applicationHandler == null) {
                 channel.setSoTimeout(settings.heartbeatMillis());
-                maintainSession(transport, input, output);
+                maintainSession(session, input);
             } else {
                 channel.setSoTimeout(0);
                 new CccApplicationSession(transport, input, output, join, applicationHandler,
-                        applicationSlots, deadlines, settings.heartbeatMillis()).run();
+                        applicationSlots, deadlines, settings.heartbeatMillis(), session.writeLock,
+                        session::allowsApplication).run();
             }
         } catch (SocketTimeoutException failure) {
             closeReason = joined ? "HEARTBEAT_TIMEOUT" : "ADMISSION_TIMEOUT";
@@ -257,21 +301,20 @@ public final class CccServer implements AutoCloseable {
         } finally {
             closeQuietly(transport);
             closeQuietly(channel);
-            try {
+            synchronized (lock) {
                 if (accepted) {
-                    appendAudit("SESSION_CLOSED", join, sessionId, fingerprint,
-                            isClosed() ? "SERVER_SHUTDOWN" : closeReason);
-                }
-            } catch (IOException failure) {
-                // The audit failure is reported by appendAudit. Release the session regardless.
-            } finally {
-                synchronized (lock) {
-                    if (sessionId != null) {
-                        activeNodes.remove(join.nodeId());
+                    String reason = session.revocationReason;
+                    if (reason == null) {
+                        reason = closed ? "SERVER_SHUTDOWN" : closeReason;
                     }
-                    connections.remove(transport);
-                    lock.notifyAll();
+                    closeAudit.offer(CccAuditLog.closeRecord(join.nodeId(), join.requestId(), join.runId(),
+                            session.id, fingerprint, reason));
                 }
+                if (session != null) {
+                    sessions.remove(join.nodeId(), session);
+                }
+                connections.remove(transport);
+                signalTermination();
             }
         }
     }
@@ -302,12 +345,35 @@ public final class CccServer implements AutoCloseable {
         }
     }
 
-    private boolean claimNode(String nodeId) throws SocketException {
+    private boolean claimNode(String nodeId, SessionControl session) throws SocketException {
         synchronized (lock) {
             if (closed) {
                 throw new SocketException("CCC is closing");
             }
-            return activeNodes.add(nodeId);
+            return sessions.putIfAbsent(nodeId, session) == null;
+        }
+    }
+
+    private void sendRevocation(SessionControl session, String reasonCode, Integer retryAfterMs) {
+        try {
+            ScheduledFuture<?> deadline = expire(session.transport, settings.admissionTimeoutMillis());
+            try {
+                synchronized (session.writeLock) {
+                    try {
+                        CccProtocol.writeRevoked(session.output, reasonCode, retryAfterMs);
+                    } finally {
+                        closeQuietly(session.transport);
+                    }
+                }
+            } finally {
+                deadline.cancel(false);
+            }
+        } catch (IOException failure) {
+            closeQuietly(session.transport);
+        } finally {
+            synchronized (lock) {
+                lock.notifyAll();
+            }
         }
     }
 
@@ -317,15 +383,18 @@ public final class CccServer implements AutoCloseable {
         CccProtocol.writeRejected(output, join.requestId(), reason, retryMillis);
     }
 
-    private void maintainSession(Socket transport, InputStream input, OutputStream output)
+    private void maintainSession(SessionControl session, InputStream input)
             throws IOException, InterruptedException {
+        Socket transport = session.transport;
         int interval = settings.heartbeatMillis();
         long intervalNanos = TimeUnit.MILLISECONDS.toNanos(interval);
         for (long sequence = 1; !isClosed() && !transport.isClosed(); sequence++) {
             long startedAt = System.nanoTime();
             ScheduledFuture<?> deadline = expire(transport, interval);
             try {
-                CccProtocol.writePing(output, sequence);
+                synchronized (session.writeLock) {
+                    CccProtocol.writePing(session.output, sequence);
+                }
                 CccProtocol.readPong(input, sequence);
                 requireWithin(startedAt, interval);
             } catch (IOException failure) {
@@ -334,13 +403,14 @@ public final class CccServer implements AutoCloseable {
             } finally {
                 deadline.cancel(false);
             }
-            waitForHeartbeat(startedAt, intervalNanos);
+            waitForHeartbeat(transport, startedAt, intervalNanos);
         }
     }
 
-    private void waitForHeartbeat(long startedAt, long intervalNanos) throws InterruptedException {
+    private void waitForHeartbeat(Socket transport, long startedAt, long intervalNanos)
+            throws InterruptedException {
         synchronized (lock) {
-            while (!closed) {
+            while (!closed && !transport.isClosed()) {
                 long remaining = intervalNanos - (System.nanoTime() - startedAt);
                 if (remaining <= 0) {
                     return;
@@ -387,6 +457,25 @@ public final class CccServer implements AutoCloseable {
             } catch (IOException failure) {
                 // Each transport is closed independently.
             }
+        }
+    }
+
+    private static final class SessionControl {
+        private final UUID id;
+        private final Socket transport;
+        private final OutputStream output;
+        private final Object writeLock = new Object();
+        private boolean admitted;
+        private volatile String revocationReason;
+
+        private SessionControl(UUID id, Socket transport, OutputStream output) {
+            this.id = id;
+            this.transport = transport;
+            this.output = output;
+        }
+
+        private boolean allowsApplication() {
+            return revocationReason == null;
         }
     }
 }

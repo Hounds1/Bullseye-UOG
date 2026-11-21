@@ -32,6 +32,14 @@ active session. CCC sends `PING` and checks the matching `PONG` sequence.
 Missed heartbeats close the connection. The join response includes
 `tcc.snapshot.v1` when the [TCC receiver](../bullseye-tcc/README.md) is enabled.
 
+UOG code can call `CccServer.revokeSession(nodeId, sessionId, reasonCode,
+retryAfterMs)` to revoke an exact live session. The method returns `true`
+when it selects that session for revocation. CCC serializes `SESSION_REVOKED`
+with heartbeat and telemetry replies and closes the connection even if
+delivery fails. An optional nonnegative `retryAfterMs` lets Core request
+approval again after the delay. Omit it to revoke until the Core process is
+restarted. Reason codes match `[A-Z][A-Z0-9_]{0,63}`.
+
 ## Audit events and handoff
 
 CCC appends `JOIN_REQUESTED`, `JOIN_ACCEPTED`, `JOIN_REJECTED`, and
@@ -39,6 +47,13 @@ CCC appends `JOIN_REQUESTED`, `JOIN_ACCEPTED`, `JOIN_REJECTED`, and
 include their own IDs, UTC timestamps, and available request, node, run,
 session, certificate, and reason fields. CCC flushes the approval record
 before sending the approval response.
+
+CCC releases a closed session and retries its `SESSION_CLOSED` write in the
+background. Retries preserve the event ID, timestamp, and body. At startup,
+CCC reconciles admitted sessions without a closing record and records them
+as `RECOVERED_AFTER_RESTART`. The timestamp of a recovery record is the
+reconciliation time. CCC preserves all complete audit records and repairs
+an incomplete final line before continuing.
 
 When [AMC](../bullseye-amc/README.md) is enabled, a worker reads completed audit
 records and hands them off in file order. The worker calls the archive outside

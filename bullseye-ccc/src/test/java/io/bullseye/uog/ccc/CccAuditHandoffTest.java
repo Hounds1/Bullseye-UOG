@@ -15,6 +15,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -117,6 +118,46 @@ class CccAuditHandoffTest {
         var audit = new CccAuditLog(source);
         assertThrows(IllegalArgumentException.class,
                 () -> new CccAuditHandoff(audit, source, ignored -> {}, POLL_MILLIS));
+    }
+
+    @Test
+    void reportsCommittedLagBeyondCheckpointAndClearsItAfterTransfer() throws Exception {
+        Path source = directory.resolve("audit.jsonl");
+        Path checkpoint = directory.resolve("handoff.offset");
+        var audit = new CccAuditLog(source);
+        append(audit, "already archived");
+        long checkpointOffset = Files.size(source);
+        Files.writeString(checkpoint, checkpointOffset + "\n");
+        append(audit, "대기 중");
+        long committedEnd = Files.size(source);
+        Files.writeString(source, "uncommitted tail", StandardOpenOption.APPEND);
+
+        var attempting = new CountDownLatch(1);
+        var allowSuccess = new CountDownLatch(1);
+        try (var handoff = new CccAuditHandoff(audit, checkpoint, json -> {
+            attempting.countDown();
+            awaitRelease(allowSuccess);
+        }, POLL_MILLIS)) {
+            assertThrows(IOException.class, handoff::progress);
+            handoff.start();
+            if (!attempting.await(5, TimeUnit.SECONDS)) {
+                throw new AssertionError("CCC audit transfer did not start");
+            }
+            assertEquals(new CccAuditHandoff.Progress(committedEnd - checkpointOffset, null),
+                    handoff.progress());
+
+            allowSuccess.countDown();
+            awaitCheckpoint(checkpoint, committedEnd);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+            while (handoff.progress().lastSuccessAt() == null && System.nanoTime() - deadline < 0) {
+                Thread.sleep(POLL_MILLIS);
+            }
+            var progress = handoff.progress();
+            assertEquals(0, progress.pendingBytes());
+            assertNotNull(progress.lastSuccessAt());
+        } finally {
+            allowSuccess.countDown();
+        }
     }
 
     private static void append(CccAuditLog audit, String nodeId) throws IOException {

@@ -9,6 +9,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -50,6 +51,27 @@ class AmcCapacityMonitorTest {
         assertTrue(warnings.getFirst().message().contains("Archive disk space low. locations=archive,pending"));
         assertEquals(2, entries.stream()
                 .filter(entry -> entry.message().contains("disk[archive,pending].usableBytes=")).count());
+    }
+
+    @Test
+    void combinesHandoffLagWithExistingUsageAndMarksAnUnavailableProbe() {
+        var entries = new ArrayList<LogEntry>();
+        var lastSuccess = Instant.parse("2026-01-01T00:00:00Z");
+        Map<String, AmcCapacityMonitor.HandoffProbe> handoffs = Map.of(
+                "cccHandoff", () -> new AmcCapacityMonitor.HandoffLag("pendingBytes", 410, lastSuccess),
+                "tccHandoff", () -> new AmcCapacityMonitor.HandoffLag("pendingLatest", 1, null),
+                "unknownHandoff", () -> { throw new IOException("Checkpoint unreadable"); });
+        try (var monitor = new AmcCapacityMonitor(
+                Map.of("archive", () -> new AmcCapacityMonitor.Usage(6, 1_000)), Map.of(), handoffs,
+                60, 0, (level, message) -> entries.add(new LogEntry(level, message)))) {
+            monitor.check();
+        }
+
+        assertEquals(List.of(new LogEntry(System.Logger.Level.INFO,
+                "[UOG] Archive storage usage. archive.records=6 archive.bytes=1000 "
+                        + "cccHandoff.pendingBytes=410 cccHandoff.lastSuccessAt=2026-01-01T00:00:00Z "
+                        + "tccHandoff.pendingLatest=1 tccHandoff.lastSuccessAt=UNKNOWN "
+                        + "unknownHandoff.status=UNAVAILABLE")), entries);
     }
 
     private record LogEntry(System.Logger.Level level, String message) {}

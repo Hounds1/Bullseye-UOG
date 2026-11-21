@@ -13,6 +13,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 /** Owns the concurrent work on one already admitted application connection. */
 final class CccApplicationSession {
@@ -27,7 +28,8 @@ final class CccApplicationSession {
     private final ScheduledThreadPoolExecutor deadlines;
     private final long heartbeatNanos;
     private final Object state = new Object();
-    private final Object writeLock = new Object();
+    private final Object writeLock;
+    private final BooleanSupplier admitted;
 
     private volatile boolean active = true;
     private volatile boolean heartbeatExpired;
@@ -38,7 +40,8 @@ final class CccApplicationSession {
 
     CccApplicationSession(Socket transport, InputStream input, OutputStream output, JoinRequest join,
             CccServer.SessionHandler handler, Semaphore applicationSlots,
-            ScheduledThreadPoolExecutor deadlines, int heartbeatMillis) {
+            ScheduledThreadPoolExecutor deadlines, int heartbeatMillis, Object writeLock,
+            BooleanSupplier admitted) {
         this.transport = transport;
         this.input = input;
         this.output = output;
@@ -46,6 +49,8 @@ final class CccApplicationSession {
         this.handler = handler;
         this.applicationSlots = applicationSlots;
         this.deadlines = deadlines;
+        this.writeLock = writeLock;
+        this.admitted = admitted;
         heartbeatNanos = TimeUnit.MILLISECONDS.toNanos(heartbeatMillis);
     }
 
@@ -95,6 +100,9 @@ final class CccApplicationSession {
             while (responding && sessionActive()) {
                 state.wait();
             }
+            if (!admitted.getAsBoolean()) {
+                return;
+            }
             if (!sessionActive() || handling || !applicationSlots.tryAcquire()) {
                 throw new IOException("CCC application frame capacity exceeded");
             }
@@ -110,17 +118,21 @@ final class CccApplicationSession {
 
     private void handle(ObjectNode frame) {
         try {
-            if (!sessionActive()) {
+            if (!handlerActive()) {
                 return;
             }
-            ObjectNode response = handler.handle(join.nodeId(), join.runId(), frame, this::sessionActive);
+            ObjectNode response = handler.handle(join.nodeId(), join.runId(), frame, this::handlerActive);
             synchronized (state) {
-                if (!sessionActive()) {
+                if (!handlerActive()) {
                     return;
                 }
                 responding = true;
             }
-            write(() -> CccProtocol.writeApplicationResponse(output, response));
+            write(() -> {
+                if (admitted.getAsBoolean()) {
+                    CccProtocol.writeApplicationResponse(output, response);
+                }
+            });
         } catch (IOException failure) {
             stop();
         } catch (RuntimeException failure) {
@@ -218,6 +230,10 @@ final class CccApplicationSession {
 
     private boolean sessionActive() {
         return active && !transport.isClosed();
+    }
+
+    private boolean handlerActive() {
+        return sessionActive() && admitted.getAsBoolean();
     }
 
     private void stop() {
