@@ -5,6 +5,7 @@ plugins {
 dependencies {
     implementation project(':bullseye-ccc')
     implementation project(':bullseye-tcc')
+    implementation project(':bullseye-amc')
 }
 
 application {
