@@ -8,10 +8,11 @@ instances. Core runs on monitored Linux hosts and connects to UOG.
 | `bullseye-uog-app` | UOG entry point, configuration, and application distribution. |
 | [bullseye-ccc](bullseye-ccc/README.md) | Cluster Control Center. Authenticates Core, manages sessions, and produces audit records. |
 | [bullseye-tcc](bullseye-tcc/README.md) | Telemetry Control Center. Validates snapshots and stores the latest record per node. |
-| [bullseye-amc](bullseye-amc/README.md) | Archive Management Center. Stores and deduplicates CCC audit events. |
+| [bullseye-amc](bullseye-amc/README.md) | Archive Management Center. Stores and deduplicates CCC audit events and TCC-accepted telemetry. |
 
-The application module connects CCC sessions to the TCC receiver and passes
-CCC audit events to the AMC archive.
+The application module connects CCC sessions to the TCC receiver. With AMC
+enabled, background workers deliver CCC audit events and TCC-accepted
+snapshots to their respective archives.
 
 ## Build
 

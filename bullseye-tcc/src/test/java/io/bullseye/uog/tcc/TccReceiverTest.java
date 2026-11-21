@@ -3,6 +3,7 @@ package io.bullseye.uog.tcc;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -18,7 +19,11 @@ import java.security.MessageDigest;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
@@ -186,6 +191,90 @@ class TccReceiverTest {
         assertEquals(newRun, JSON.readTree(Files.readString(latest)));
         try (var files = Files.list(latestDirectory)) {
             assertEquals(List.of(latest), files.toList());
+        }
+    }
+
+    @Test
+    void handsOffEveryAcceptedSnapshotAfterRestartIncludingTheExistingLatest() throws Exception {
+        ObjectNode first = fixture("initializing");
+        ObjectNode second = fixture("evaluated");
+        ObjectNode third = second.deepCopy().put("sequence", 3);
+
+        var legacy = new TccReceiver(latestDirectory);
+        assertAck(legacy.receive(NODE, RUN, frame(first), () -> true), 1, "ACCEPTED", null);
+
+        try (var receiver = new TccReceiver(latestDirectory, ignored -> {})) {
+            assertAck(receiver.receive(NODE, RUN, frame(second), () -> true), 2, "ACCEPTED", null);
+            assertAck(receiver.receive(NODE, RUN, frame(third), () -> true), 3, "ACCEPTED", null);
+            assertAck(receiver.receive(NODE, RUN, frame(third), () -> true), 3, "DUPLICATE", null);
+            ObjectNode conflict = third.deepCopy();
+            snapshot(conflict).put("host", "changed");
+            assertAck(receiver.receive(NODE, RUN, frame(conflict), () -> true),
+                    3, "REJECTED", "SEQUENCE_CONFLICT");
+        }
+
+        Set<ObjectNode> received = ConcurrentHashMap.newKeySet();
+        var receivedAll = new CountDownLatch(3);
+        try (var restarted = new TccReceiver(latestDirectory, json -> {
+            if (received.add((ObjectNode) JSON.readTree(json))) {
+                receivedAll.countDown();
+            }
+        })) {
+            restarted.startHandoff();
+            assertTrue(receivedAll.await(5, TimeUnit.SECONDS));
+            assertEquals(Set.of(first, second, third), received);
+        }
+    }
+
+    @Test
+    void keepsPreviousLatestIfTheLocalHandoffQueueCannotBeWritten() throws Exception {
+        ObjectNode first = fixture("initializing");
+        ObjectNode second = fixture("evaluated");
+        try (var receiver = new TccReceiver(latestDirectory, ignored -> {})) {
+            assertAck(receiver.receive(NODE, RUN, frame(first), () -> true), 1, "ACCEPTED", null);
+            Path pending = latestDirectory.resolve(".amc-pending");
+            Files.createFile(pending);
+
+            assertAck(receiver.receive(NODE, RUN, frame(second), () -> true),
+                    2, "RETRYABLE", "PERSISTENCE_UNAVAILABLE");
+            assertEquals(first, JSON.readTree(Files.readString(latestFile(NODE))));
+
+            Files.delete(pending);
+            assertAck(receiver.receive(NODE, RUN, frame(second), () -> true), 2, "ACCEPTED", null);
+            try (var files = Files.list(pending)) {
+                List<Path> queued = files.toList();
+                assertEquals(1, queued.size());
+                assertEquals(first, JSON.readTree(Files.readString(queued.getFirst())));
+            }
+        }
+    }
+
+    @Test
+    void continuesAcceptingWhileTheArchiveIsUnavailableAndRetriesTheSameSnapshot() throws Exception {
+        ObjectNode first = fixture("initializing");
+        ObjectNode second = fixture("evaluated");
+        var firstAttempt = new CountDownLatch(1);
+        var recovered = new CountDownLatch(1);
+        var receivedAll = new CountDownLatch(2);
+        Set<ObjectNode> received = ConcurrentHashMap.newKeySet();
+
+        try (var receiver = new TccReceiver(latestDirectory, json -> {
+            if (recovered.getCount() != 0) {
+                firstAttempt.countDown();
+                throw new IOException("Archive temporarily unavailable");
+            }
+            if (received.add((ObjectNode) JSON.readTree(json))) {
+                receivedAll.countDown();
+            }
+        })) {
+            assertAck(receiver.receive(NODE, RUN, frame(first), () -> true), 1, "ACCEPTED", null);
+            receiver.startHandoff();
+            assertTrue(firstAttempt.await(5, TimeUnit.SECONDS));
+            assertAck(receiver.receive(NODE, RUN, frame(second), () -> true), 2, "ACCEPTED", null);
+
+            recovered.countDown();
+            assertTrue(receivedAll.await(5, TimeUnit.SECONDS));
+            assertEquals(Set.of(first, second), received);
         }
     }
 

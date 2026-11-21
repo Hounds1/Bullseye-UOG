@@ -1,6 +1,7 @@
 package io.bullseye.uog;
 
 import io.bullseye.uog.amc.AmcAuditArchive;
+import io.bullseye.uog.amc.AmcTelemetryArchive;
 import io.bullseye.uog.ccc.CccAuditHandoff;
 import io.bullseye.uog.ccc.CccServer;
 import io.bullseye.uog.tcc.TccReceiver;
@@ -20,7 +21,8 @@ public final class UogApplication {
     private static final String TCC_ENABLED = "bullseye.uog.tcc.enabled";
     private static final String TCC_DIRECTORY = "bullseye.uog.tcc.latest-directory";
     private static final String AMC_ENABLED = "bullseye.uog.amc.enabled";
-    private static final String AMC_DIRECTORY = "bullseye.uog.amc.ccc-audit-directory";
+    private static final String AMC_AUDIT_DIRECTORY = "bullseye.uog.amc.ccc-audit-directory";
+    private static final String AMC_TELEMETRY_DIRECTORY = "bullseye.uog.amc.tcc-telemetry-directory";
     private static final String AUDIT_CHECKPOINT = CCC_PREFIX + "audit-checkpoint";
 
     private UogApplication() {}
@@ -37,12 +39,17 @@ public final class UogApplication {
         var settings = loadCccSettings(properties);
         requireTlsStore("javax.net.ssl.keyStore");
         requireTlsStore("javax.net.ssl.trustStore");
-        try (var server = createServer(SSLContext.getDefault(), settings, properties);
-                var handoff = createAuditHandoff(server, settings, properties)) {
+        boolean archiveEnabled = enabled(properties, AMC_ENABLED);
+        try (var tcc = createTcc(properties, archiveEnabled);
+                var server = createServer(SSLContext.getDefault(), settings, tcc);
+                var handoff = createAuditHandoff(server, settings, properties, archiveEnabled)) {
             Runtime.getRuntime().addShutdownHook(
-                    new Thread(() -> shutdown(server, handoff), "bullseye-uog-shutdown"));
+                    new Thread(() -> shutdown(server, handoff, tcc), "bullseye-uog-shutdown"));
             if (handoff != null) {
                 handoff.start();
+            }
+            if (tcc != null) {
+                tcc.startHandoff();
             }
             server.start();
             System.out.println("[UOG] Cluster control online. address=" + server.localAddress());
@@ -50,22 +57,34 @@ public final class UogApplication {
         }
     }
 
-    private static CccServer createServer(
-            SSLContext tls, CccServer.Settings settings, Properties properties) throws IOException {
+    private static TccReceiver createTcc(Properties properties, boolean archiveEnabled) throws IOException {
         if (!enabled(properties, TCC_ENABLED)) {
+            return null;
+        }
+        Path latest = Path.of(text(properties, TCC_DIRECTORY, "var/tcc/latest"));
+        if (!archiveEnabled) {
+            return new TccReceiver(latest);
+        }
+        var archive = new AmcTelemetryArchive(
+                Path.of(text(properties, AMC_TELEMETRY_DIRECTORY, "var/amc/tcc-telemetry")));
+        return new TccReceiver(latest, archive::store);
+    }
+
+    private static CccServer createServer(
+            SSLContext tls, CccServer.Settings settings, TccReceiver tcc) throws IOException {
+        if (tcc == null) {
             return new CccServer(tls, settings);
         }
-        var tcc = new TccReceiver(Path.of(text(properties, TCC_DIRECTORY, "var/tcc/latest")));
         return new CccServer(tls, settings, TccReceiver.CAPABILITY, tcc::receive);
     }
 
-    private static CccAuditHandoff createAuditHandoff(
-            CccServer server, CccServer.Settings settings, Properties properties) {
-        if (!enabled(properties, AMC_ENABLED)) {
+    private static CccAuditHandoff createAuditHandoff(CccServer server, CccServer.Settings settings,
+            Properties properties, boolean archiveEnabled) {
+        if (!archiveEnabled) {
             return null;
         }
         var archive = new AmcAuditArchive(
-                Path.of(text(properties, AMC_DIRECTORY, "var/amc/ccc-audit")));
+                Path.of(text(properties, AMC_AUDIT_DIRECTORY, "var/amc/ccc-audit")));
         Path checkpoint = Path.of(text(properties, AUDIT_CHECKPOINT,
                 settings.auditFile() + ".amc-offset"));
         return server.auditHandoff(checkpoint, archive::store);
@@ -126,7 +145,7 @@ public final class UogApplication {
         }
     }
 
-    private static void shutdown(CccServer server, CccAuditHandoff handoff) {
+    private static void shutdown(CccServer server, CccAuditHandoff handoff, TccReceiver tcc) {
         server.close();
         try {
             server.awaitTermination();
@@ -135,6 +154,9 @@ public final class UogApplication {
         } finally {
             if (handoff != null) {
                 handoff.close();
+            }
+            if (tcc != null) {
+                tcc.close();
             }
         }
     }
