@@ -28,7 +28,7 @@ corrupt or contains a node ID reserved by a manual entry. Omit
 `bullseye.uog.ccc.registration-file` for manual-only admission and configure at
 least one manual entry. Both manual and registered nodes must pass mutual TLS
 trust validation before CCC checks their pin. The registration method provides
-the in-process entry point for a future administrative API or CLI.
+the in-process entry point for the [enrollment API v1](ENROLLMENT-V1.md).
 
 ### TLS stores
 
