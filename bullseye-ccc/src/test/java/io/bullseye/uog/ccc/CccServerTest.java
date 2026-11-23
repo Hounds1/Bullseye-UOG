@@ -62,6 +62,7 @@ class CccServerTest {
     private static SSLContext otherClient;
     private static SSLContext noClientCertificate;
     private static String registeredFingerprint;
+    private static String otherFingerprint;
 
     @TempDir
     private Path output;
@@ -78,8 +79,9 @@ class CccServerTest {
         registeredClient = tls(registered, serverCertificate);
         otherClient = tls(other, serverCertificate);
         noClientCertificate = tls(null, serverCertificate);
-        registeredFingerprint = HexFormat.of().formatHex(
-                MessageDigest.getInstance("SHA-256").digest(registeredCertificate.getEncoded()));
+        MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
+        registeredFingerprint = HexFormat.of().formatHex(sha256.digest(registeredCertificate.getEncoded()));
+        otherFingerprint = HexFormat.of().formatHex(sha256.digest(otherCertificate.getEncoded()));
     }
 
     @Test
@@ -256,6 +258,38 @@ class CccServerTest {
         assertRejected(otherClient, NODE_ID);
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void appliesLiveRegistrationAndReloadsItForLaterAdmissions(boolean applicationEnabled) throws Exception {
+        String newNode = "new-core";
+        Path registryFile = output.resolve("nodes.json");
+        var manualPins = Map.of(NODE_ID, registeredFingerprint);
+        var registry = new CccNodeRegistry(registryFile, manualPins);
+
+        try (var server = registeredServer(registry, applicationEnabled)) {
+            assertEquals("JOIN_ACCEPTED",
+                    joinResponse(server, registeredClient, NODE_ID).path("type").textValue());
+            JsonNode unknown = joinResponse(server, otherClient, newNode);
+            assertEquals("JOIN_REJECTED", unknown.path("type").textValue());
+            assertEquals("UNAUTHORIZED_NODE", unknown.path("reasonCode").textValue());
+
+            assertTrue(registry.register(newNode, otherFingerprint));
+            JsonNode wrongLeaf = joinResponse(server, registeredClient, newNode);
+            assertEquals("JOIN_REJECTED", wrongLeaf.path("type").textValue());
+            assertEquals("UNAUTHORIZED_NODE", wrongLeaf.path("reasonCode").textValue());
+            assertEquals("JOIN_ACCEPTED", joinResponse(server, otherClient, newNode).path("type").textValue());
+        }
+
+        var reloadedRegistry = new CccNodeRegistry(registryFile, manualPins);
+        try (var restarted = registeredServer(reloadedRegistry, applicationEnabled)) {
+            JsonNode accepted = joinResponse(restarted, otherClient, newNode);
+            assertEquals("JOIN_ACCEPTED", accepted.path("type").textValue());
+            if (applicationEnabled) {
+                assertEquals("app.v1", accepted.path("capabilities").path(0).textValue());
+            }
+        }
+    }
+
     @Test
     void requiresClientCertificateBeforeAdmission() throws Exception {
         try (CccServer server = server();
@@ -315,18 +349,42 @@ class CccServerTest {
     }
 
     private CccServer server(CccServer.SessionHandler handler) throws IOException {
-        CccServer.Settings settings = new CccServer.Settings(
-                new InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
-                Map.of(NODE_ID, registeredFingerprint),
-                auditPath(),
-                handler == null ? HEARTBEAT_MILLIS : APPLICATION_HEARTBEAT_MILLIS,
-                3_000,
-                8);
+        CccServer.Settings settings = settings(handler == null ? HEARTBEAT_MILLIS : APPLICATION_HEARTBEAT_MILLIS);
         CccServer server = handler == null
                 ? new CccServer(serverContext, settings)
                 : new CccServer(serverContext, settings, "app.v1", handler);
         server.start();
         return server;
+    }
+
+    private CccServer registeredServer(CccNodeRegistry registry, boolean applicationEnabled) throws IOException {
+        CccServer.Settings settings = settings(applicationEnabled ? APPLICATION_HEARTBEAT_MILLIS : HEARTBEAT_MILLIS);
+        CccServer server = applicationEnabled
+                ? new CccServer(serverContext, settings, registry, "app.v1",
+                        (nodeId, runId, frame, active) -> message("APP_ACK"))
+                : new CccServer(serverContext, settings, registry);
+        server.start();
+        return server;
+    }
+
+    private CccServer.Settings settings(int heartbeatMillis) {
+        return new CccServer.Settings(
+                new InetSocketAddress(InetAddress.getLoopbackAddress(), 0),
+                Map.of(NODE_ID, registeredFingerprint),
+                auditPath(),
+                heartbeatMillis,
+                3_000,
+                8);
+    }
+
+    private static JsonNode joinResponse(CccServer server, SSLContext context, String nodeId) throws IOException {
+        try (SSLSocket connection = connect(server, context)) {
+            ObjectNode request = join(nodeId);
+            send(connection, request);
+            JsonNode response = read(connection);
+            assertEquals(request.path("requestId"), response.path("requestId"));
+            return response;
+        }
     }
 
     private Path auditPath() {
