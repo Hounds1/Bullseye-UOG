@@ -240,7 +240,7 @@ class CccNodeRegistryTest {
                 Arguments.of("null root", "null"),
                 Arguments.of("array root", "[]"),
                 Arguments.of("missing schema version", "{\"nodes\":{}}"),
-                Arguments.of("unsupported schema version", "{\"schemaVersion\":2,\"nodes\":{}}"),
+                Arguments.of("unsupported schema version", "{\"schemaVersion\":3,\"nodes\":{}}"),
                 Arguments.of("non-numeric schema version", "{\"schemaVersion\":\"1\",\"nodes\":{}}"),
                 Arguments.of("missing nodes", "{\"schemaVersion\":1}"),
                 Arguments.of("null nodes", "{\"schemaVersion\":1,\"nodes\":null}"),

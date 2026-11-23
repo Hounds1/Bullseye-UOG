@@ -7,15 +7,22 @@ import io.bullseye.uog.amc.AmcTelemetryArchive;
 import io.bullseye.uog.ccc.CccAuditHandoff;
 import io.bullseye.uog.ccc.CccNodeRegistry;
 import io.bullseye.uog.ccc.CccServer;
+import io.bullseye.uog.ccc.enrollment.EnrollmentIssuer;
+import io.bullseye.uog.ccc.enrollment.EnrollmentServer;
 import io.bullseye.uog.tcc.TccReceiver;
 import io.bullseye.uog.tcc.TccTelemetryHandoff;
 
 import javax.net.ssl.SSLContext;
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.util.Arrays;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
@@ -24,6 +31,7 @@ public final class UogApplication {
     private static final String CCC_PREFIX = "bullseye.uog.ccc.";
     private static final String ALLOW_PREFIX = CCC_PREFIX + "allow.";
     private static final String REGISTRATION_FILE = CCC_PREFIX + "registration-file";
+    private static final String ENROLLMENT_PREFIX = "bullseye.uog.enrollment.";
     private static final String TCC_ENABLED = "bullseye.uog.tcc.enabled";
     private static final String TCC_DIRECTORY = "bullseye.uog.tcc.latest-directory";
     private static final String AMC_ENABLED = "bullseye.uog.amc.enabled";
@@ -45,17 +53,25 @@ public final class UogApplication {
         }
         Path registrationFile = properties.getProperty(REGISTRATION_FILE) == null
                 ? null : Path.of(text(properties, REGISTRATION_FILE, ""));
+        boolean enrollmentEnabled = enabled(properties, ENROLLMENT_PREFIX + "enabled", false);
+        if (enrollmentEnabled && registrationFile == null) {
+            throw new IllegalArgumentException("Enrollment requires " + REGISTRATION_FILE);
+        }
         var settings = loadCccSettings(properties, registrationFile != null);
         requireTlsStore("javax.net.ssl.keyStore");
         requireTlsStore("javax.net.ssl.trustStore");
         boolean archiveEnabled = enabled(properties, AMC_ENABLED);
         var registry = createNodeRegistry(registrationFile, settings, properties, archiveEnabled);
+        SSLContext tls = SSLContext.getDefault();
         try (var tcc = createTcc(properties, archiveEnabled);
-                var server = createServer(SSLContext.getDefault(), settings, registry, tcc);
+                var server = createServer(tls, settings, registry, tcc);
                 var handoff = createAuditHandoff(server, settings, properties, archiveEnabled);
-                var capacity = createCapacityMonitor(settings, properties, handoff, tcc)) {
+                var capacity = createCapacityMonitor(settings, properties, handoff, tcc);
+                var enrollment = enrollmentEnabled
+                        ? createEnrollment(tls, server.localAddress().getPort(), registry, properties) : null) {
             Runtime.getRuntime().addShutdownHook(
-                    new Thread(() -> shutdown(server, handoff, tcc, capacity), "bullseye-uog-shutdown"));
+                    new Thread(() -> shutdown(server, handoff, tcc, capacity, enrollment),
+                            "bullseye-uog-shutdown"));
             if (handoff != null) {
                 handoff.start();
             }
@@ -64,11 +80,68 @@ public final class UogApplication {
             }
             server.start();
             System.out.println("[UOG] Cluster control online. address=" + server.localAddress());
+            if (enrollment != null) {
+                enrollment.start();
+                System.out.println("[UOG] Enrollment API online. address=" + enrollment.localAddress());
+            }
             if (capacity != null) {
                 capacity.start();
             }
             server.awaitTermination();
         }
+    }
+
+    private static EnrollmentServer createEnrollment(
+            SSLContext tls, int cccPort, CccNodeRegistry registry, Properties properties) throws IOException {
+        String bindHost = text(properties, ENROLLMENT_PREFIX + "bind-host", "127.0.0.1");
+        int port = integerProperty(properties, ENROLLMENT_PREFIX + "port", 8443);
+        URI origin = URI.create(text(properties, ENROLLMENT_PREFIX + "public-origin", ""));
+        String cccHost = text(properties, ENROLLMENT_PREFIX + "ccc-host", "");
+        Path caFile = enrollmentPath(properties, "server-ca-file");
+        var settings = new EnrollmentServer.Settings(new InetSocketAddress(bindHost, port), origin,
+                cccHost, cccPort, serverCertificates(caFile));
+        Path issuerFile = enrollmentPath(properties, "issuer-keystore");
+        String issuerAlias = text(properties, ENROLLMENT_PREFIX + "issuer-alias", "");
+        char[] issuerPassword = readEnrollmentSecret(enrollmentPath(properties, "issuer-password-file")).toCharArray();
+        EnrollmentIssuer issuer;
+        try {
+            issuer = new EnrollmentIssuer(issuerFile, issuerPassword, issuerAlias);
+        } finally {
+            Arrays.fill(issuerPassword, '\0');
+        }
+        String adminToken = readEnrollmentSecret(enrollmentPath(properties, "admin-token-file"));
+        return new EnrollmentServer(tls, settings, adminToken, registry, issuer);
+    }
+
+    private static Path enrollmentPath(Properties properties, String name) {
+        return Path.of(text(properties, ENROLLMENT_PREFIX + name, ""));
+    }
+
+    private static String readEnrollmentSecret(Path file) throws IOException {
+        String value = Files.readString(file, StandardCharsets.UTF_8).stripTrailing();
+        if (value.isBlank() || value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0) {
+            throw new IOException("Enrollment secret file must contain one nonblank line: " + file);
+        }
+        return value;
+    }
+
+    private static String serverCertificates(Path file) throws IOException {
+        var encoded = new StringBuilder();
+        var base64 = Base64.getMimeEncoder(64, new byte[]{'\n'});
+        try (var input = Files.newInputStream(file)) {
+            var certificates = CertificateFactory.getInstance("X.509").generateCertificates(input);
+            if (certificates.isEmpty()) {
+                throw new IOException("Enrollment server trust file has no X.509 certificates: " + file);
+            }
+            for (var certificate : certificates) {
+                encoded.append("-----BEGIN CERTIFICATE-----\n")
+                        .append(base64.encodeToString(certificate.getEncoded()))
+                        .append("\n-----END CERTIFICATE-----\n");
+            }
+        } catch (CertificateException failure) {
+            throw new IOException("Cannot read enrollment server trust certificates: " + file, failure);
+        }
+        return encoded.toString();
     }
 
     private static TccReceiver createTcc(Properties properties, boolean archiveEnabled) throws IOException {
@@ -198,7 +271,11 @@ public final class UogApplication {
     }
 
     private static boolean enabled(Properties properties, String key) {
-        String value = text(properties, key, "true");
+        return enabled(properties, key, true);
+    }
+
+    private static boolean enabled(Properties properties, String key, boolean defaultValue) {
+        String value = text(properties, key, Boolean.toString(defaultValue));
         if ("true".equalsIgnoreCase(value)) {
             return true;
         }
@@ -238,10 +315,14 @@ public final class UogApplication {
     }
 
     private static int integer(Properties properties, String key, int defaultValue) {
+        return integerProperty(properties, CCC_PREFIX + key, defaultValue);
+    }
+
+    private static int integerProperty(Properties properties, String key, int defaultValue) {
         try {
-            return Integer.parseInt(text(properties, CCC_PREFIX + key, Integer.toString(defaultValue)));
+            return Integer.parseInt(text(properties, key, Integer.toString(defaultValue)));
         } catch (NumberFormatException failure) {
-            throw new IllegalArgumentException(CCC_PREFIX + key + " must be an integer", failure);
+            throw new IllegalArgumentException(key + " must be an integer", failure);
         }
     }
 
@@ -253,7 +334,10 @@ public final class UogApplication {
     }
 
     private static void shutdown(CccServer server, CccAuditHandoff handoff, TccReceiver tcc,
-            AmcCapacityMonitor capacity) {
+            AmcCapacityMonitor capacity, EnrollmentServer enrollment) {
+        if (enrollment != null) {
+            enrollment.close();
+        }
         if (capacity != null) {
             capacity.close();
         }
