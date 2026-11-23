@@ -21,6 +21,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -32,10 +33,10 @@ import java.util.regex.Pattern;
 
 /** Server-authenticated HTTPS listener for initial CCC node enrollment. */
 public final class EnrollmentServer implements AutoCloseable {
-    private static final int API_VERSION = 1;
+    private static final int API_VERSION = 2;
     private static final int MAX_BODY_BYTES = 16 * 1_024;
-    private static final String INVITATIONS = "/api/enrollment/v1/invitations";
-    private static final String REDEEM = "/api/enrollment/v1/redeem";
+    private static final String INVITATIONS = "/api/enrollment/v2/invitations";
+    private static final String REDEEM = "/api/enrollment/v2/redeem";
     private static final Pattern ADMIN_SECRET = Pattern.compile("[0-9a-f]{64}");
     private static final Pattern INVITE_CODE = Pattern.compile("[A-Za-z0-9_-]{43}");
     private static final ObjectMapper JSON = new ObjectMapper()
@@ -131,9 +132,11 @@ public final class EnrollmentServer implements AutoCloseable {
             } catch (CccNodeRegistry.EnrollmentException failure) {
                 response = switch (failure.code()) {
                     case "INVALID_NODE_ID" -> error(400, "INVALID_NODE_ID");
+                    case "INVALID_PUBLIC_KEY_SHA256" -> error(400, "INVALID_PUBLIC_KEY_SHA256");
                     case "INVALID_OR_EXPIRED_CODE" -> error(401, "INVALID_OR_EXPIRED_CODE");
                     case "NODE_ID_IN_USE" -> error(409, "NODE_ID_IN_USE");
                     case "REQUEST_CONFLICT" -> error(409, "REQUEST_CONFLICT");
+                    case "PUBLIC_KEY_MISMATCH" -> error(409, "PUBLIC_KEY_MISMATCH");
                     default -> error(503, "TEMPORARY_UNAVAILABLE");
                 };
             } catch (IOException | RuntimeException failure) {
@@ -172,13 +175,15 @@ public final class EnrollmentServer implements AutoCloseable {
                     || !MessageDigest.isEqual(adminSecret, bearer.getBytes(StandardCharsets.US_ASCII))) {
                 return error(401, "UNAUTHORIZED");
             }
-            JsonNode request = readObject(exchange, 1);
+            JsonNode request = readObject(exchange, 2);
             String nodeId = readText(request, "nodeId");
-            var invite = registry.issueInvite(nodeId);
+            String publicKeySha256 = request.path("publicKeySha256").textValue();
+            var invite = registry.issueInvite(nodeId, publicKeySha256);
             var body = JSON.createObjectNode()
                     .put("apiVersion", API_VERSION)
                     .put("enrollmentUrl", settings.publicOrigin().resolve(REDEEM).toString())
                     .put("nodeId", nodeId)
+                    .put("publicKeySha256", publicKeySha256.toLowerCase(Locale.ROOT))
                     .put("expiresAt", invite.expiresAt().toString())
                     .put("code", invite.code())
                     .put("serverCaPem", settings.serverCaPem());
@@ -191,18 +196,19 @@ public final class EnrollmentServer implements AutoCloseable {
         JsonNode request = readObject(exchange, 2);
         UUID requestId = requestId(readText(request, "requestId"));
         String csrPem = readText(request, "csrPem");
-        String response = registry.redeemInvite(bearer, requestId, sha256(csrPem),
-                nodeId -> issue(nodeId, csrPem));
-        return new Response(200, response);
-    }
-
-    private CccNodeRegistry.Issued issue(String nodeId, String csrPem) throws IOException {
-        EnrollmentIssuer.Certificate certificate;
+        EnrollmentIssuer.VerifiedCsr csr;
         try {
-            certificate = issuer.issue(nodeId, csrPem);
+            csr = EnrollmentIssuer.verifyCsr(csrPem);
         } catch (IllegalArgumentException invalid) {
             throw new HttpFailure(400, "INVALID_CSR");
         }
+        String response = registry.redeemInvite(bearer, requestId, sha256(csrPem), csr.publicKeySha256(),
+                nodeId -> issue(nodeId, csr));
+        return new Response(200, response);
+    }
+
+    private CccNodeRegistry.Issued issue(String nodeId, EnrollmentIssuer.VerifiedCsr csr) throws IOException {
+        EnrollmentIssuer.Certificate certificate = issuer.issue(nodeId, csr);
         var body = JSON.createObjectNode()
                 .put("apiVersion", API_VERSION)
                 .put("nodeId", nodeId)

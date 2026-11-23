@@ -71,10 +71,10 @@ public final class CccNodeRegistry {
         }
     }
 
-    private record PendingInvite(String nodeId, Instant expiresAt) {}
+    private record PendingInvite(String nodeId, String publicKeySha256, Instant expiresAt) {}
 
     private record Redemption(
-            String nodeId, UUID requestId, String csrSha256, String fingerprint,
+            String nodeId, UUID requestId, String csrSha256, String publicKeySha256, String fingerprint,
             String responseJson, Instant replayUntil) {}
 
     private record State(
@@ -131,14 +131,16 @@ public final class CccNodeRegistry {
         return true;
     }
 
-    /** Issues a one-use code. Reissuing replaces this node's previous unused code. */
-    public synchronized Invite issueInvite(String nodeId) throws IOException, EnrollmentException {
+    /** Issues a one-use code bound to an approved SPKI digest, replacing any unused code for this node. */
+    public synchronized Invite issueInvite(String nodeId, String publicKeySha256)
+            throws IOException, EnrollmentException {
         if (nodeId == null || !NODE_ID.matcher(nodeId).matches()) {
             throw new EnrollmentException("INVALID_NODE_ID");
         }
         if (manualNodeIds.contains(nodeId) || state.nodes().containsKey(nodeId)) {
             throw new EnrollmentException("NODE_ID_IN_USE");
         }
+        String approvedKey = publicKeyDigest(publicKeySha256);
 
         Instant now = clock.instant();
         var invites = activeInvites(now);
@@ -153,22 +155,26 @@ public final class CccNodeRegistry {
             digest = digest(code);
         } while (invites.containsKey(digest) || redemptions.containsKey(digest));
         Instant expiresAt = now.plus(INVITE_TTL);
-        invites.put(digest, new PendingInvite(nodeId, expiresAt));
-        commit(new State(2, state.nodes(), invites, redemptions));
+        invites.put(digest, new PendingInvite(nodeId, approvedKey, expiresAt));
+        commit(new State(3, state.nodes(), invites, redemptions));
         return new Invite(code, expiresAt);
     }
 
-    /** Commits the consumed code, new pin and exact response in the same atomic replacement. */
+    /** Accepts the verified CSR's SPKI digest and atomically commits code consumption, pin and response. */
     public synchronized String redeemInvite(
-            String code, UUID requestId, String csrSha256, Issuer issuer)
+            String code, UUID requestId, String csrSha256, String publicKeySha256, Issuer issuer)
             throws IOException, EnrollmentException {
         if (code == null || !INVITE_CODE.matcher(code).matches()) {
             throw new EnrollmentException("INVALID_OR_EXPIRED_CODE");
         }
+        String suppliedKey = publicKeyDigest(publicKeySha256);
         String codeDigest = digest(code);
         Instant now = clock.instant();
         Redemption previous = state.redemptions().get(codeDigest);
         if (previous != null && previous.replayUntil().isAfter(now)) {
+            if (!previous.publicKeySha256().equals(suppliedKey)) {
+                throw new EnrollmentException("PUBLIC_KEY_MISMATCH");
+            }
             if (!previous.requestId().equals(requestId)
                     || csrSha256 == null || !previous.csrSha256().equalsIgnoreCase(csrSha256)) {
                 throw new EnrollmentException("REQUEST_CONFLICT");
@@ -179,6 +185,9 @@ public final class CccNodeRegistry {
         PendingInvite invite = state.invites().get(codeDigest);
         if (invite == null || !invite.expiresAt().isAfter(now)) {
             throw new EnrollmentException("INVALID_OR_EXPIRED_CODE");
+        }
+        if (!invite.publicKeySha256().equals(suppliedKey)) {
+            throw new EnrollmentException("PUBLIC_KEY_MISMATCH");
         }
         if (requestId == null || csrSha256 == null
                 || !CERTIFICATE_SHA256.matcher(csrSha256).matches()) {
@@ -201,9 +210,9 @@ public final class CccNodeRegistry {
         invites.remove(codeDigest);
         var redemptions = activeRedemptions(committedAt);
         redemptions.put(codeDigest, new Redemption(
-                invite.nodeId(), requestId, csrSha256.toLowerCase(Locale.ROOT), fingerprint,
+                invite.nodeId(), requestId, csrSha256.toLowerCase(Locale.ROOT), suppliedKey, fingerprint,
                 issued.responseJson(), committedAt.plus(REPLAY_TTL)));
-        commit(new State(2, nodes, invites, redemptions));
+        commit(new State(3, nodes, invites, redemptions));
         return issued.responseJson();
     }
 
@@ -234,6 +243,13 @@ public final class CccNodeRegistry {
         }
     }
 
+    private static String publicKeyDigest(String digest) throws EnrollmentException {
+        if (digest == null || !CERTIFICATE_SHA256.matcher(digest).matches()) {
+            throw new EnrollmentException("INVALID_PUBLIC_KEY_SHA256");
+        }
+        return digest.toLowerCase(Locale.ROOT);
+    }
+
     boolean reserves(Set<String> manualNodes) {
         return manualNodeIds.equals(manualNodes);
     }
@@ -254,7 +270,7 @@ public final class CccNodeRegistry {
             JsonNode version = root.path("schemaVersion");
             if (!version.isIntegralNumber()
                     || !version.canConvertToInt()
-                    || (version.intValue() != 1 && version.intValue() != 2)
+                    || (version.intValue() != 1 && version.intValue() != 2 && version.intValue() != 3)
                     || root.size() != (version.intValue() == 1 ? 2 : 4)) {
                 throw new IOException("Invalid CCC registration file schema: " + file);
             }
@@ -276,6 +292,14 @@ public final class CccNodeRegistry {
             if (version.intValue() == 1) {
                 return new State(1, nodes, Map.of(), Map.of());
             }
+            if (version.intValue() == 2) {
+                if (!root.path("invites").isObject() || !root.path("redemptions").isObject()) {
+                    throw new IOException("Invalid legacy CCC enrollment file schema: " + file);
+                }
+                // Legacy bearer codes and their v1 responses must never authorize a bound enrollment.
+                // Preserve existing certificate pins and migrate the retired state on the next write.
+                return new State(3, nodes, Map.of(), Map.of());
+            }
             return loadEnrollmentState(root, nodes);
         } catch (NoSuchFileException missing) {
             return new State(1, Map.of(), Map.of(), Map.of());
@@ -295,13 +319,15 @@ public final class CccNodeRegistry {
                 requireDigest(entry.getKey());
                 JsonNode value = entry.getValue();
                 String nodeId = text(value, "nodeId");
-                if (!value.isObject() || value.size() != 2 || !NODE_ID.matcher(nodeId).matches()
+                String publicKeySha256 = text(value, "publicKeySha256");
+                requireDigest(publicKeySha256);
+                if (!value.isObject() || value.size() != 3 || !NODE_ID.matcher(nodeId).matches()
                         || manualNodeIds.contains(nodeId) || nodes.containsKey(nodeId)
                         || !pendingNodes.add(nodeId)) {
                     throw new IllegalArgumentException("Invalid pending invitation");
                 }
                 invites.put(entry.getKey(), new PendingInvite(
-                        nodeId, Instant.parse(text(value, "expiresAt"))));
+                        nodeId, publicKeySha256, Instant.parse(text(value, "expiresAt"))));
             }
             for (var entry : root.path("redemptions").properties()) {
                 requireDigest(entry.getKey());
@@ -309,9 +335,11 @@ public final class CccNodeRegistry {
                 String nodeId = text(value, "nodeId");
                 String fingerprint = text(value, "fingerprint");
                 String csrSha256 = text(value, "csrSha256");
+                String publicKeySha256 = text(value, "publicKeySha256");
                 requireDigest(csrSha256);
+                requireDigest(publicKeySha256);
                 validateBinding(nodeId, fingerprint);
-                if (!value.isObject() || value.size() != 6 || !NODE_ID.matcher(nodeId).matches()
+                if (!value.isObject() || value.size() != 7 || !NODE_ID.matcher(nodeId).matches()
                         || !fingerprint.equals(nodes.get(nodeId))
                         || invites.containsKey(entry.getKey()) || !redeemedNodes.add(nodeId)) {
                     throw new IllegalArgumentException("Invalid committed enrollment");
@@ -322,13 +350,13 @@ public final class CccNodeRegistry {
                     throw new IllegalArgumentException("Invalid enrollment request ID");
                 }
                 redemptions.put(entry.getKey(), new Redemption(
-                        nodeId, requestId, csrSha256, fingerprint, text(value, "responseJson"),
+                        nodeId, requestId, csrSha256, publicKeySha256, fingerprint, text(value, "responseJson"),
                         Instant.parse(text(value, "replayUntil"))));
             }
         } catch (IllegalArgumentException | DateTimeException invalid) {
             throw new IOException("Invalid CCC enrollment record: " + file, invalid);
         }
-        return new State(2, nodes, invites, redemptions);
+        return new State(3, nodes, invites, redemptions);
     }
 
     private static void requireDigest(String value) {
@@ -350,16 +378,19 @@ public final class CccNodeRegistry {
         var document = JSON.createObjectNode().put("schemaVersion", state.version());
         var bindings = document.putObject("nodes");
         new TreeMap<>(state.nodes()).forEach(bindings::put);
-        if (state.version() == 2) {
+        if (state.version() == 3) {
             var invites = document.putObject("invites");
             new TreeMap<>(state.invites()).forEach((digest, invite) -> invites.putObject(digest)
-                    .put("nodeId", invite.nodeId()).put("expiresAt", invite.expiresAt().toString()));
+                    .put("nodeId", invite.nodeId())
+                    .put("publicKeySha256", invite.publicKeySha256())
+                    .put("expiresAt", invite.expiresAt().toString()));
             var redemptions = document.putObject("redemptions");
             new TreeMap<>(state.redemptions()).forEach((digest, redemption) ->
                     redemptions.putObject(digest)
                             .put("nodeId", redemption.nodeId())
                             .put("requestId", redemption.requestId().toString())
                             .put("csrSha256", redemption.csrSha256())
+                            .put("publicKeySha256", redemption.publicKeySha256())
                             .put("fingerprint", redemption.fingerprint())
                             .put("responseJson", redemption.responseJson())
                             .put("replayUntil", redemption.replayUntil().toString()));
