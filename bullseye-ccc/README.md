@@ -3,13 +3,34 @@
 ## Configuration
 
 UOG binds to `127.0.0.1:7443` by default. Set
-`bullseye.uog.ccc.bind-host` to the interface where Core connects. Set one
-`bullseye.uog.ccc.allow.<nodeId>` entry per node with its leaf client
-certificate's SHA-256 fingerprint as 64 hexadecimal characters. Use
-`keytool -list -v` on the client's key store to obtain the fingerprint, then
-remove the colons. The [sample configuration](../config/bullseye-uog.properties)
+`bullseye.uog.ccc.bind-host` to the interface where Core connects.
+Use a leaf client certificate's SHA-256 fingerprint as 64 hexadecimal characters.
+Obtain it with `keytool -list -v` on the client's key store and remove the colons.
+The [sample configuration](../config/bullseye-uog.properties)
 includes the heartbeat interval, admission timeout, connection limit, and
 audit file location.
+
+### Node registration
+
+Set `bullseye.uog.ccc.registration-file` to enable persistent node registration.
+The sample uses `var/ccc-nodes.json`. Keep this file separate from the live audit
+file and AMC handoff checkpoint. Use one UOG process per registration file.
+UOG can start with an empty registry, and a
+trusted in-process integration can register a node through
+`CccNodeRegistry.register(nodeId, certificateSha256)` on the registry used by
+the running CCC server. A successful registration is saved for subsequent
+connections and survives restart. Repeating the same registered node ID and
+fingerprint is safe. A different fingerprint for a registered node is rejected.
+
+Manual `bullseye.uog.ccc.allow.<nodeId>` entries remain active and reserve their
+node IDs from registration. UOG fails to start if the registration file is
+corrupt or contains a node ID reserved by a manual entry. Omit
+`bullseye.uog.ccc.registration-file` for manual-only admission and configure at
+least one manual entry. Both manual and registered nodes must pass mutual TLS
+trust validation before CCC checks their pin. The registration method provides
+the in-process entry point for a future administrative API or CLI.
+
+### TLS stores
 
 Configure the JVM's `javax.net.ssl.keyStore` and
 `javax.net.ssl.trustStore` before starting UOG. The key store contains the

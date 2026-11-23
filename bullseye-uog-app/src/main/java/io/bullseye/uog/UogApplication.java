@@ -5,6 +5,7 @@ import io.bullseye.uog.amc.AmcCapacityMonitor;
 import io.bullseye.uog.amc.AmcFileCapacity;
 import io.bullseye.uog.amc.AmcTelemetryArchive;
 import io.bullseye.uog.ccc.CccAuditHandoff;
+import io.bullseye.uog.ccc.CccNodeRegistry;
 import io.bullseye.uog.ccc.CccServer;
 import io.bullseye.uog.tcc.TccReceiver;
 import io.bullseye.uog.tcc.TccTelemetryHandoff;
@@ -22,6 +23,7 @@ import java.util.Properties;
 public final class UogApplication {
     private static final String CCC_PREFIX = "bullseye.uog.ccc.";
     private static final String ALLOW_PREFIX = CCC_PREFIX + "allow.";
+    private static final String REGISTRATION_FILE = CCC_PREFIX + "registration-file";
     private static final String TCC_ENABLED = "bullseye.uog.tcc.enabled";
     private static final String TCC_DIRECTORY = "bullseye.uog.tcc.latest-directory";
     private static final String AMC_ENABLED = "bullseye.uog.amc.enabled";
@@ -41,12 +43,15 @@ public final class UogApplication {
         try (var reader = Files.newBufferedReader(config, StandardCharsets.UTF_8)) {
             properties.load(reader);
         }
-        var settings = loadCccSettings(properties);
+        Path registrationFile = properties.getProperty(REGISTRATION_FILE) == null
+                ? null : Path.of(text(properties, REGISTRATION_FILE, ""));
+        var settings = loadCccSettings(properties, registrationFile != null);
         requireTlsStore("javax.net.ssl.keyStore");
         requireTlsStore("javax.net.ssl.trustStore");
         boolean archiveEnabled = enabled(properties, AMC_ENABLED);
+        var registry = createNodeRegistry(registrationFile, settings, properties, archiveEnabled);
         try (var tcc = createTcc(properties, archiveEnabled);
-                var server = createServer(SSLContext.getDefault(), settings, tcc);
+                var server = createServer(SSLContext.getDefault(), settings, registry, tcc);
                 var handoff = createAuditHandoff(server, settings, properties, archiveEnabled);
                 var capacity = createCapacityMonitor(settings, properties, handoff, tcc)) {
             Runtime.getRuntime().addShutdownHook(
@@ -78,12 +83,40 @@ public final class UogApplication {
         return new TccReceiver(latest, archive::store);
     }
 
-    private static CccServer createServer(
-            SSLContext tls, CccServer.Settings settings, TccReceiver tcc) throws IOException {
-        if (tcc == null) {
-            return new CccServer(tls, settings);
+    private static CccNodeRegistry createNodeRegistry(Path registrationFile, CccServer.Settings settings,
+            Properties properties, boolean archiveEnabled) throws IOException {
+        if (registrationFile == null) {
+            return null;
         }
-        return new CccServer(tls, settings, TccReceiver.CAPABILITY, tcc::receive);
+        requireSeparateRegistryFile(registrationFile, settings.auditFile());
+        if (archiveEnabled) {
+            requireSeparateRegistryFile(registrationFile, auditCheckpoint(settings, properties));
+        }
+        return new CccNodeRegistry(registrationFile, settings.allowedNodes());
+    }
+
+    private static void requireSeparateRegistryFile(Path registrationFile, Path other) throws IOException {
+        Path registryPath = registrationFile.toAbsolutePath().normalize();
+        Path otherPath = other.toAbsolutePath().normalize();
+        Path registryParent = registryPath.getParent();
+        Path otherParent = otherPath.getParent();
+        boolean sameEntry = registryParent != null && otherParent != null
+                && registryPath.getFileName().equals(otherPath.getFileName())
+                && Files.isDirectory(registryParent) && Files.isDirectory(otherParent)
+                && Files.isSameFile(registryParent, otherParent);
+        if (registryPath.equals(otherPath) || sameEntry
+                || (Files.exists(registryPath) && Files.exists(otherPath) && Files.isSameFile(registryPath, otherPath))) {
+            throw new IllegalArgumentException(REGISTRATION_FILE + " must name a separate file from " + other);
+        }
+    }
+
+    private static CccServer createServer(
+            SSLContext tls, CccServer.Settings settings, CccNodeRegistry registry, TccReceiver tcc)
+            throws IOException {
+        if (tcc == null) {
+            return new CccServer(tls, settings, registry);
+        }
+        return new CccServer(tls, settings, registry, TccReceiver.CAPABILITY, tcc::receive);
     }
 
     private static CccAuditHandoff createAuditHandoff(CccServer server, CccServer.Settings settings,
@@ -92,9 +125,11 @@ public final class UogApplication {
             return null;
         }
         var archive = new AmcAuditArchive(auditArchiveDirectory(properties));
-        Path checkpoint = Path.of(text(properties, AUDIT_CHECKPOINT,
-                settings.auditFile() + ".amc-offset"));
-        return server.auditHandoff(checkpoint, archive::store);
+        return server.auditHandoff(auditCheckpoint(settings, properties), archive::store);
+    }
+
+    private static Path auditCheckpoint(CccServer.Settings settings, Properties properties) {
+        return Path.of(text(properties, AUDIT_CHECKPOINT, settings.auditFile() + ".amc-offset"));
     }
 
     private static AmcCapacityMonitor createCapacityMonitor(
@@ -173,7 +208,7 @@ public final class UogApplication {
         throw new IllegalArgumentException(key + " must be true or false");
     }
 
-    private static CccServer.Settings loadCccSettings(Properties properties) {
+    private static CccServer.Settings loadCccSettings(Properties properties, boolean registrationEnabled) {
         var allowedNodes = new HashMap<String, String>();
         for (String key : properties.stringPropertyNames()) {
             if (key.startsWith(ALLOW_PREFIX)) {
@@ -181,7 +216,7 @@ public final class UogApplication {
                 allowedNodes.put(nodeId, properties.getProperty(key).strip());
             }
         }
-        if (allowedNodes.isEmpty()) {
+        if (allowedNodes.isEmpty() && !registrationEnabled) {
             throw new IllegalArgumentException("Configure at least one " + ALLOW_PREFIX + "<nodeId>");
         }
         String host = text(properties, CCC_PREFIX + "bind-host", "127.0.0.1");

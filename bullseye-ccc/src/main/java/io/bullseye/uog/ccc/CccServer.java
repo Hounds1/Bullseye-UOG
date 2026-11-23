@@ -32,11 +32,9 @@ import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
-import java.util.regex.Pattern;
 
 public final class CccServer implements AutoCloseable {
     private static final System.Logger LOGGER = System.getLogger(CccServer.class.getName());
-    private static final Pattern CERTIFICATE_SHA256 = Pattern.compile("[0-9a-fA-F]{64}");
 
     @FunctionalInterface
     public interface SessionHandler {
@@ -56,11 +54,7 @@ public final class CccServer implements AutoCloseable {
             Objects.requireNonNull(address, "address");
             Objects.requireNonNull(auditFile, "auditFile");
             allowedNodes = Map.copyOf(allowedNodes);
-            allowedNodes.forEach((nodeId, fingerprint) -> {
-                if (nodeId.isBlank() || !CERTIFICATE_SHA256.matcher(fingerprint).matches()) {
-                    throw new IllegalArgumentException("Invalid CCC node or certificate fingerprint");
-                }
-            });
+            allowedNodes.forEach(CccNodeRegistry::validateBinding);
             if (heartbeatMillis <= 0 || admissionTimeoutMillis <= 0 || maxConnections <= 0) {
                 throw new IllegalArgumentException("CCC timeouts and connection limit must be positive");
             }
@@ -70,6 +64,7 @@ public final class CccServer implements AutoCloseable {
     private final ServerSocket listener;
     private final SSLSocketFactory tlsFactory;
     private final Settings settings;
+    private final CccNodeRegistry registry;
     private final CccAuditLog audit;
     private final CccCloseAudit closeAudit;
     private final ScheduledThreadPoolExecutor deadlines;
@@ -85,17 +80,30 @@ public final class CccServer implements AutoCloseable {
     private boolean shutdownCompleted;
 
     public CccServer(SSLContext tls, Settings settings) throws IOException {
-        this(tls, settings, null, null);
+        this(tls, settings, null, null, null);
+    }
+
+    public CccServer(SSLContext tls, Settings settings, CccNodeRegistry registry) throws IOException {
+        this(tls, settings, registry, null, null);
     }
 
     public CccServer(SSLContext tls, Settings settings, String applicationCapability,
             SessionHandler handler) throws IOException {
+        this(tls, settings, null, applicationCapability, handler);
+    }
+
+    public CccServer(SSLContext tls, Settings settings, CccNodeRegistry registry,
+            String applicationCapability, SessionHandler handler) throws IOException {
         if ((handler == null) != (applicationCapability == null)
                 || (applicationCapability != null && applicationCapability.isBlank())) {
             throw new IllegalArgumentException("CCC application capability and handler must be supplied together");
         }
         tlsFactory = Objects.requireNonNull(tls, "tls").getSocketFactory();
         this.settings = Objects.requireNonNull(settings, "settings");
+        if (registry != null && !registry.reserves(settings.allowedNodes().keySet())) {
+            throw new IllegalArgumentException("CCC registry and listener must reserve the same manual node IDs");
+        }
+        this.registry = registry;
         this.applicationCapability = applicationCapability;
         applicationHandler = handler;
         applicationSlots = handler == null ? null : new Semaphore(settings.maxConnections());
@@ -255,7 +263,7 @@ public final class CccServer implements AutoCloseable {
                 output = channel.getOutputStream();
                 join = CccProtocol.readJoin(input);
                 appendAudit("JOIN_REQUESTED", join, null, fingerprint, null);
-                if (!fingerprint.equalsIgnoreCase(settings.allowedNodes().get(join.nodeId()))) {
+                if (!fingerprint.equalsIgnoreCase(expectedFingerprint(join.nodeId()))) {
                     reject(output, join, fingerprint, "UNAUTHORIZED_NODE", null);
                     return;
                 }
@@ -333,6 +341,11 @@ public final class CccServer implements AutoCloseable {
             closeQuietly(socket);
             throw failure;
         }
+    }
+
+    private String expectedFingerprint(String nodeId) {
+        String manual = settings.allowedNodes().get(nodeId);
+        return manual != null || registry == null ? manual : registry.fingerprint(nodeId);
     }
 
     private static String fingerprint(SSLSocket channel) throws IOException {
