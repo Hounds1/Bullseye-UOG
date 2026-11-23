@@ -1,5 +1,6 @@
 package io.bullseye.uog.ccc.enrollment;
 
+import org.bouncycastle.asn1.ASN1Encoding;
 import org.bouncycastle.asn1.DERUTF8String;
 import org.bouncycastle.asn1.x500.X500NameBuilder;
 import org.bouncycastle.asn1.x500.style.BCStyle;
@@ -47,7 +48,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 
-/** Issues v1 Core client certificates using an operator-supplied PKCS12 CA key. */
+/** Issues Core client certificates using an operator-supplied PKCS12 CA key. */
 public final class EnrollmentIssuer {
     private static final String CSR_LABEL = "CERTIFICATE REQUEST";
     private static final String KEYTOOL_CSR_LABEL = "NEW CERTIFICATE REQUEST";
@@ -56,6 +57,8 @@ public final class EnrollmentIssuer {
             Base64.getMimeEncoder(64, new byte[] {'\n'});
 
     public record Certificate(String fingerprint, String chainPem) {}
+
+    record VerifiedCsr(PublicKey publicKey, String publicKeySha256) {}
 
     private final PrivateKey privateKey;
     private final List<X509Certificate> issuerChain;
@@ -102,11 +105,11 @@ public final class EnrollmentIssuer {
         }
     }
 
-    public Certificate issue(String nodeId, String csrPem) throws IOException {
+    Certificate issue(String nodeId, VerifiedCsr csr) throws IOException {
         if (nodeId == null || nodeId.isBlank()) {
             throw new IllegalArgumentException("An approved node ID is required");
         }
-        PublicKey clientKey = verifiedClientKey(csrPem);
+        PublicKey clientKey = csr.publicKey();
         Instant now = Instant.now();
         Instant notBefore = now.truncatedTo(ChronoUnit.SECONDS);
         Instant notAfter = notBefore.plus(LEAF_VALIDITY);
@@ -162,12 +165,13 @@ public final class EnrollmentIssuer {
         }
     }
 
-    private static PublicKey verifiedClientKey(String pem) {
+    static VerifiedCsr verifyCsr(String pem) {
         try {
             var request = new PKCS10CertificationRequest(decodeRequest(pem));
-            var key = request.getSubjectPublicKeyInfo().getAlgorithm();
-            if (!X9ObjectIdentifiers.id_ecPublicKey.equals(key.getAlgorithm())
-                    || !X9ObjectIdentifiers.prime256v1.equals(key.getParameters())
+            var publicKeyInfo = request.getSubjectPublicKeyInfo();
+            var algorithm = publicKeyInfo.getAlgorithm();
+            if (!X9ObjectIdentifiers.id_ecPublicKey.equals(algorithm.getAlgorithm())
+                    || !X9ObjectIdentifiers.prime256v1.equals(algorithm.getParameters())
                     || !X9ObjectIdentifiers.ecdsa_with_SHA256.equals(request.getSignatureAlgorithm().getAlgorithm())) {
                 throw new IllegalArgumentException("A P-256 CSR signed with ECDSA/SHA-256 is required");
             }
@@ -175,7 +179,9 @@ public final class EnrollmentIssuer {
             if (!request.isSignatureValid(new JcaContentVerifierProviderBuilder().build(publicKey))) {
                 throw new IllegalArgumentException("Invalid CSR signature");
             }
-            return publicKey;
+            String publicKeySha256 = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                    .digest(publicKeyInfo.getEncoded(ASN1Encoding.DER)));
+            return new VerifiedCsr(publicKey, publicKeySha256);
         } catch (IOException | GeneralSecurityException | OperatorCreationException | PKCSException failure) {
             throw new IllegalArgumentException("Invalid Core certificate signing request", failure);
         }

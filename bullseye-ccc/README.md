@@ -27,8 +27,9 @@ node IDs from registration. UOG fails to start if the registration file is
 corrupt or contains a node ID reserved by a manual entry. Omit
 `bullseye.uog.ccc.registration-file` for manual-only admission and configure at
 least one manual entry. Both manual and registered nodes must pass mutual TLS
-trust validation before CCC checks their pin. The registration method provides
-the in-process entry point for the [enrollment API v1](ENROLLMENT-V1.md).
+trust validation before CCC checks their pin. The
+[key-bound enrollment API v2](ENROLLMENT-V2.md) uses this registry to persist
+the issued certificate fingerprints.
 
 ### TLS stores
 

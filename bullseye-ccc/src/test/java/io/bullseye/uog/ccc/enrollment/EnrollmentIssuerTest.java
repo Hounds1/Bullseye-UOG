@@ -73,7 +73,10 @@ class EnrollmentIssuerTest {
             request = request.replace("CERTIFICATE REQUEST", "NEW CERTIFICATE REQUEST");
         }
 
-        var issued = issuer.issue(approved, request);
+        var verified = EnrollmentIssuer.verifyCsr(request);
+        assertEquals(HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                .digest(clientKey.getPublic().getEncoded())), verified.publicKeySha256());
+        var issued = issuer.issue(approved, verified);
         List<X509Certificate> chain = parseChain(issued.chainPem());
         X509Certificate leaf = chain.getFirst();
         assertEquals(2, chain.size());
@@ -93,7 +96,7 @@ class EnrollmentIssuerTest {
                 Duration.between(leaf.getNotBefore().toInstant(), leaf.getNotAfter().toInstant()));
         assertEquals(HexFormat.of().formatHex(
                 MessageDigest.getInstance("SHA-256").digest(leaf.getEncoded())), issued.fingerprint());
-        assertNotEquals(leaf.getSerialNumber(), parseChain(issuer.issue(approved, request).chainPem())
+        assertNotEquals(leaf.getSerialNumber(), parseChain(issuer.issue(approved, verified).chainPem())
                 .getFirst().getSerialNumber());
     }
 
@@ -111,8 +114,8 @@ class EnrollmentIssuerTest {
                 keyStore(intermediate, issuerCertificate, rootCertificate), PASSWORD, ISSUER_ALIAS);
         KeyPair client = keyPair("EC");
 
-        List<X509Certificate> chain = parseChain(
-                issuer.issue("edge-42", csr(client.getPublic(), client.getPrivate())).chainPem());
+        var verified = EnrollmentIssuer.verifyCsr(csr(client.getPublic(), client.getPrivate()));
+        List<X509Certificate> chain = parseChain(issuer.issue("edge-42", verified).chainPem());
         assertEquals(3, chain.size());
         assertEquals(expiresFirst, chain.getFirst().getNotAfter().toInstant());
         assertEquals(issuerCertificate, chain.get(1));
@@ -121,20 +124,16 @@ class EnrollmentIssuerTest {
 
     @Test
     void rejectsWrongKeyProofUnsupportedCurvesAndMultipleRequests() throws Exception {
-        KeyPair authorityKey = keyPair("EC");
-        X509Certificate authority = authority(ROOT, ROOT, authorityKey.getPublic(),
-                authorityKey.getPrivate(), Instant.now().plus(Duration.ofDays(120)), true);
-        var issuer = new EnrollmentIssuer(keyStore(authorityKey, authority), PASSWORD, ISSUER_ALIAS);
         KeyPair client = keyPair("EC");
         String valid = csr(client.getPublic(), client.getPrivate());
         String wrongSignature = csr(client.getPublic(), keyPair("EC").getPrivate());
         KeyPair alternateCurve = curveKeyPair("secp384r1");
         String unsupported = csr(alternateCurve.getPublic(), alternateCurve.getPrivate());
 
-        assertThrows(IllegalArgumentException.class, () -> issuer.issue("edge-42", wrongSignature));
-        assertThrows(IllegalArgumentException.class, () -> issuer.issue("edge-42", unsupported));
-        assertThrows(IllegalArgumentException.class, () -> issuer.issue("edge-42", valid + valid));
-        assertThrows(IllegalArgumentException.class, () -> issuer.issue("edge-42", valid + "trailing data"));
+        assertThrows(IllegalArgumentException.class, () -> EnrollmentIssuer.verifyCsr(wrongSignature));
+        assertThrows(IllegalArgumentException.class, () -> EnrollmentIssuer.verifyCsr(unsupported));
+        assertThrows(IllegalArgumentException.class, () -> EnrollmentIssuer.verifyCsr(valid + valid));
+        assertThrows(IllegalArgumentException.class, () -> EnrollmentIssuer.verifyCsr(valid + "trailing data"));
     }
 
     @Test

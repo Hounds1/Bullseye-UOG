@@ -2,6 +2,7 @@ package io.bullseye.uog.ccc.enrollment;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -44,8 +45,8 @@ import org.junit.jupiter.api.io.TempDir;
 class EnrollmentServerTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String ADMIN_TOKEN = "a".repeat(64);
-    private static final String INVITATIONS = "/api/enrollment/v1/invitations";
-    private static final String REDEEM = "/api/enrollment/v1/redeem";
+    private static final String INVITATIONS = "/api/enrollment/v2/invitations";
+    private static final String REDEEM = "/api/enrollment/v2/redeem";
     private static final String NODE_ID = "edge-01";
     private static final URI PUBLIC_ORIGIN = URI.create("https://enrollment.example:8443");
     private static final char[] STORE_PASSWORD = "fixture-only".toCharArray();
@@ -59,6 +60,8 @@ class EnrollmentServerTest {
     private static SSLContext clientTls;
     private static EnrollmentIssuer issuer;
     private static String csrPem;
+    private static String otherCsrPem;
+    private static String publicKeySha256;
     private static String serverCaPem;
 
     @BeforeAll
@@ -66,16 +69,14 @@ class EnrollmentServerTest {
         Path serverStore = generateKey("server", "SAN=ip:127.0.0.1", "EKU=serverAuth");
         Path issuerStore = generateKey("issuer", "BC:critical=ca:true", "KU:critical=keyCertSign");
         Path clientStore = generateKey("core");
-        Path request = certificates.resolve("core.csr");
-        keytool("-certreq", "-alias", "core", "-keystore", clientStore.toString(), "-storepass",
-                String.valueOf(STORE_PASSWORD), "-sigalg", "SHA256withECDSA", "-file", request.toString());
-        csrPem = Files.readString(request);
+        csrPem = generateCsr(clientStore, "core");
+        otherCsrPem = generateCsr(generateKey("other-core"), "other-core");
+        var clientCertificate = loadStore(clientStore).getCertificate("core");
+        publicKeySha256 = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                .digest(clientCertificate.getPublicKey().getEncoded()));
         issuer = new EnrollmentIssuer(issuerStore, STORE_PASSWORD, "issuer");
 
-        KeyStore serverKeys = KeyStore.getInstance("PKCS12");
-        try (var stream = Files.newInputStream(serverStore)) {
-            serverKeys.load(stream, STORE_PASSWORD);
-        }
+        KeyStore serverKeys = loadStore(serverStore);
         var serverCertificate = serverKeys.getCertificate("server");
         var export = Base64.getMimeEncoder(64, new byte[] {'\n'});
         serverCaPem = "-----BEGIN CERTIFICATE-----\n"
@@ -99,16 +100,17 @@ class EnrollmentServerTest {
     void enrollsOverHttpsWithoutAClientCertificateAndReplaysTheSameRequest() throws Exception {
         var registry = new CccNodeRegistry(output.resolve("nodes.json"), Map.of());
         try (var server = server(registry); var client = client()) {
-            String invitation = JSON.createObjectNode().put("nodeId", NODE_ID).toString();
+            String invitation = invitationRequest(publicKeySha256.toUpperCase(Locale.ROOT));
             var denied = send(client, server, "POST", INVITATIONS, "b".repeat(64), invitation);
             assertError(denied, 401, "UNAUTHORIZED");
 
             var accepted = send(client, server, "POST", INVITATIONS, ADMIN_TOKEN, invitation);
             assertEquals(201, accepted.statusCode());
             JsonNode invite = JSON.readTree(accepted.body());
-            assertEquals(1, invite.path("apiVersion").asInt());
+            assertEquals(2, invite.path("apiVersion").asInt());
             assertEquals(PUBLIC_ORIGIN.resolve(REDEEM).toString(), invite.path("enrollmentUrl").asText());
             assertEquals(NODE_ID, invite.path("nodeId").asText());
+            assertEquals(publicKeySha256, invite.path("publicKeySha256").asText());
             assertEquals(serverCaPem, invite.path("serverCaPem").asText());
             assertTrue(Instant.parse(invite.path("expiresAt").asText()).isAfter(Instant.now()));
             String code = invite.path("code").asText();
@@ -119,7 +121,7 @@ class EnrollmentServerTest {
             var first = send(client, server, "POST", REDEEM, code, payload);
             assertEquals(200, first.statusCode(), first::body);
             JsonNode enrollment = JSON.readTree(first.body());
-            assertEquals(1, enrollment.path("apiVersion").asInt());
+            assertEquals(2, enrollment.path("apiVersion").asInt());
             assertEquals(NODE_ID, enrollment.path("nodeId").asText());
             assertEquals("ccc.example", enrollment.path("ccc").path("host").asText());
             assertEquals(7443, enrollment.path("ccc").path("port").asInt());
@@ -140,6 +142,26 @@ class EnrollmentServerTest {
     }
 
     @Test
+    void rejectsAnUnapprovedCsrKeyWithoutConsumingTheInvitation() throws Exception {
+        var registry = new CccNodeRegistry(output.resolve("nodes.json"), Map.of());
+        try (var server = server(registry); var client = client()) {
+            var accepted = send(client, server, "POST", INVITATIONS, ADMIN_TOKEN,
+                    invitationRequest(publicKeySha256));
+            assertEquals(201, accepted.statusCode());
+            String code = JSON.readTree(accepted.body()).path("code").asText();
+            String requestId = UUID.randomUUID().toString();
+
+            assertError(send(client, server, "POST", REDEEM, code, redeemRequest(requestId, otherCsrPem)),
+                    409, "PUBLIC_KEY_MISMATCH");
+            assertNull(registry.fingerprint(NODE_ID));
+
+            var success = send(client, server, "POST", REDEEM, code, redeemRequest(requestId, csrPem));
+            assertEquals(200, success.statusCode(), success::body);
+            assertNotNull(registry.fingerprint(NODE_ID));
+        }
+    }
+
+    @Test
     void validatesRoutesAuthorizationAndBodiesBeforeChangingAdmissionState() throws Exception {
         var registry = new CccNodeRegistry(output.resolve("nodes.json"), Map.of());
         try (var server = server(registry); var client = client()) {
@@ -148,14 +170,20 @@ class EnrollmentServerTest {
             assertEquals("POST", wrongMethod.headers().firstValue("Allow").orElseThrow());
             assertError(send(client, server, "POST", INVITATIONS + "/extra", ADMIN_TOKEN, "{}"),
                     404, "NOT_FOUND");
+            assertError(send(client, server, "POST", "/api/enrollment/v1/invitations", ADMIN_TOKEN,
+                    "{\"nodeId\":\"edge-01\"}"), 404, "NOT_FOUND");
+            assertError(send(client, server, "POST", "/api/enrollment/v1/redeem", null, "{}"),
+                    404, "NOT_FOUND");
             assertError(send(client, server, "POST", INVITATIONS, ADMIN_TOKEN,
                     "{\"nodeId\":\"edge-01\",\"nodeId\":\"edge-02\"}"), 400, "INVALID_REQUEST");
+            assertError(send(client, server, "POST", INVITATIONS, ADMIN_TOKEN, invitationRequest("invalid")),
+                    400, "INVALID_PUBLIC_KEY_SHA256");
             assertError(send(client, server, "POST", INVITATIONS, ADMIN_TOKEN,
                     "{\"nodeId\":\"" + "a".repeat(17_000) + "\"}"), 413, "BODY_TOO_LARGE");
             assertError(send(client, server, "POST", REDEEM, ADMIN_TOKEN, "{}"),
                     401, "INVALID_OR_EXPIRED_CODE");
 
-            String invitation = JSON.createObjectNode().put("nodeId", NODE_ID).toString();
+            String invitation = invitationRequest(publicKeySha256);
             var accepted = send(client, server, "POST", INVITATIONS, ADMIN_TOKEN, invitation);
             assertEquals(201, accepted.statusCode());
             String code = JSON.readTree(accepted.body()).path("code").asText();
@@ -211,8 +239,28 @@ class EnrollmentServerTest {
         assertEquals(JSON.createObjectNode().put("code", code), JSON.readTree(response.body()));
     }
 
+    private static String invitationRequest(String keySha256) {
+        return JSON.createObjectNode().put("nodeId", NODE_ID).put("publicKeySha256", keySha256).toString();
+    }
+
     private static String redeemRequest(String requestId, String request) {
         return JSON.createObjectNode().put("requestId", requestId).put("csrPem", request).toString();
+    }
+
+    private static String generateCsr(Path store, String alias) throws Exception {
+        Path request = certificates.resolve(alias + ".csr");
+        keytool("-certreq", "-alias", alias, "-keystore", store.toString(), "-storepass",
+                String.valueOf(STORE_PASSWORD), "-dname", "CN=" + NODE_ID,
+                "-sigalg", "SHA256withECDSA", "-file", request.toString());
+        return Files.readString(request);
+    }
+
+    private static KeyStore loadStore(Path file) throws Exception {
+        KeyStore store = KeyStore.getInstance("PKCS12");
+        try (var input = Files.newInputStream(file)) {
+            store.load(input, STORE_PASSWORD);
+        }
+        return store;
     }
 
     private static Path generateKey(String alias, String... extensions) throws Exception {
